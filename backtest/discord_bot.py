@@ -613,7 +613,10 @@ class LiveOrderConfirmView(View):
             )
             return
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+            except (discord.NotFound, discord.errors.NotFound, discord.HTTPException):
+                pass
         for item in self.children:
             item.disabled = True
         if self.message:
@@ -747,7 +750,10 @@ class ClosePositionConfirmView(View):
             )
             return
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+            except (discord.NotFound, discord.errors.NotFound, discord.HTTPException):
+                pass
         for item in self.children:
             item.disabled = True
         if self.message:
@@ -5544,6 +5550,17 @@ class BacktestBot(commands.Bot):
             return ", ".join(parts)
         return str(exc)
 
+    @staticmethod
+    def _interaction_is_expired(interaction: discord.Interaction) -> bool:
+        check = getattr(interaction, "is_expired", None)
+        if callable(check):
+            try:
+                return bool(check())
+            except Exception:
+                return False
+        expired = getattr(interaction, "expired", None)
+        return bool(expired) if isinstance(expired, bool) else False
+
     @classmethod
     def _is_post_only_reject(cls, exc: Exception) -> bool:
         code, msg, body = cls._extract_binance_error(exc)
@@ -5551,6 +5568,14 @@ class BacktestBot(commands.Bot):
             return True
         text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
         return "post only" in text or "post-only" in text or "immediately trigger" in text
+
+    @classmethod
+    def _is_reduce_only_not_required(cls, exc: Exception) -> bool:
+        code, msg, body = cls._extract_binance_error(exc)
+        if code != -1106:
+            return False
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        return "reduceonly" in text and "not required" in text
 
     @classmethod
     def _is_filter_error(cls, exc: Exception) -> bool:
@@ -5711,6 +5736,7 @@ class BacktestBot(commands.Bot):
         last_error_note: Optional[str] = None
         forced_min_price: Optional[float] = None
         forced_max_price: Optional[float] = None
+        reduce_only_param = reduce_only
         while remaining_qty > 0:
             attempt += 1
             if max_attempts > 0 and attempt > max_attempts:
@@ -5770,7 +5796,7 @@ class BacktestBot(commands.Bot):
                     side,
                     qty_param,
                     price_param,
-                    reduce_only,
+                    reduce_only_param,
                     position_side,
                 )
             except Exception as exc:
@@ -5787,7 +5813,11 @@ class BacktestBot(commands.Bot):
                             bound_max
                             if forced_max_price is None
                             else min(forced_max_price, bound_max)
-                        )
+                    )
+                    last_error_note = f"Order failed: {self._format_binance_error(exc)}"
+                    continue
+                if self._is_reduce_only_not_required(exc) and reduce_only_param:
+                    reduce_only_param = False
                     last_error_note = f"Order failed: {self._format_binance_error(exc)}"
                     continue
                 if self._is_filter_error(exc) and not filters_refreshed:
@@ -5882,10 +5912,26 @@ class BacktestBot(commands.Bot):
     ) -> None:
         async def _send(message: str, *, ephemeral: bool = False) -> None:
             if isinstance(target, discord.Interaction):
-                if target.response.is_done():
-                    await target.followup.send(message, ephemeral=ephemeral)
-                else:
-                    await target.response.send_message(message, ephemeral=ephemeral)
+                channel = getattr(target, "channel", None)
+                if self._interaction_is_expired(target):
+                    if channel is not None:
+                        await channel.send(message)
+                    return
+                try:
+                    if target.response.is_done():
+                        await target.followup.send(message, ephemeral=ephemeral)
+                    else:
+                        await target.response.send_message(message, ephemeral=ephemeral)
+                    return
+                except (discord.NotFound, discord.errors.NotFound, discord.HTTPException) as exc:
+                    if getattr(exc, "code", None) not in {None, 10062}:
+                        raise
+                    try:
+                        await target.followup.send(message, ephemeral=ephemeral)
+                        return
+                    except Exception:
+                        if channel is not None:
+                            await channel.send(message)
             else:
                 await target.reply(message)
 
@@ -5914,11 +5960,19 @@ class BacktestBot(commands.Bot):
         except Exception as exc:
             leverage_note = f"Leverage set failed: {self._format_binance_error(exc)}"
 
+        qty = draft.qty
+        if draft.usdt_amount > 0 and draft.price > 0 and draft.leverage > 0:
+            expected_qty = (draft.usdt_amount * draft.leverage) / draft.price
+            if expected_qty > 0:
+                diff = abs(qty - expected_qty) / expected_qty if qty > 0 else 1.0
+                if qty <= 0 or diff > 0.01:
+                    qty = expected_qty
+
         result = await self._place_limit_maker_with_retry(
             client=client,
             symbol=draft.symbol,
             side=draft.side,
-            qty=draft.qty,
+            qty=qty,
             base_price=draft.price,
             reduce_only=draft.reduce_only,
             position_side=draft.position_side,
@@ -5943,7 +5997,7 @@ class BacktestBot(commands.Bot):
             f"\nRemaining qty: {remaining_qty:.6g}" if remaining_qty > 0 else ""
         )
         await _send(
-            f"Live order {status}: {draft.position_side} {draft.qty:.6g} {draft.symbol} "
+            f"Live order {status}: {draft.position_side} {qty:.6g} {draft.symbol} "
             f"@ {self._fmt_price(draft.price)} (lev {draft.leverage:.2f}x){suffix}"
             f"{remaining_text}{extras}",
             ephemeral=isinstance(target, discord.Interaction),
@@ -5956,10 +6010,26 @@ class BacktestBot(commands.Bot):
     ) -> None:
         async def _send(message: str, *, ephemeral: bool = False) -> None:
             if isinstance(target, discord.Interaction):
-                if target.response.is_done():
-                    await target.followup.send(message, ephemeral=ephemeral)
-                else:
-                    await target.response.send_message(message, ephemeral=ephemeral)
+                channel = getattr(target, "channel", None)
+                if self._interaction_is_expired(target):
+                    if channel is not None:
+                        await channel.send(message)
+                    return
+                try:
+                    if target.response.is_done():
+                        await target.followup.send(message, ephemeral=ephemeral)
+                    else:
+                        await target.response.send_message(message, ephemeral=ephemeral)
+                    return
+                except (discord.NotFound, discord.errors.NotFound, discord.HTTPException) as exc:
+                    if getattr(exc, "code", None) not in {None, 10062}:
+                        raise
+                    try:
+                        await target.followup.send(message, ephemeral=ephemeral)
+                        return
+                    except Exception:
+                        if channel is not None:
+                            await channel.send(message)
             else:
                 await target.reply(message)
 
@@ -10378,10 +10448,26 @@ class BacktestBot(commands.Bot):
     ) -> None:
         async def _send(message: str, *, ephemeral: bool = False) -> None:
             if isinstance(target, discord.Interaction):
-                if target.response.is_done():
-                    await target.followup.send(message, ephemeral=ephemeral)
-                else:
-                    await target.response.send_message(message, ephemeral=ephemeral)
+                channel = getattr(target, "channel", None)
+                if self._interaction_is_expired(target):
+                    if channel is not None:
+                        await channel.send(message)
+                    return
+                try:
+                    if target.response.is_done():
+                        await target.followup.send(message, ephemeral=ephemeral)
+                    else:
+                        await target.response.send_message(message, ephemeral=ephemeral)
+                    return
+                except (discord.NotFound, discord.errors.NotFound, discord.HTTPException) as exc:
+                    if getattr(exc, "code", None) not in {None, 10062}:
+                        raise
+                    try:
+                        await target.followup.send(message, ephemeral=ephemeral)
+                        return
+                    except Exception:
+                        if channel is not None:
+                            await channel.send(message)
             else:
                 await target.reply(message)
 
@@ -10392,15 +10478,29 @@ class BacktestBot(commands.Bot):
             ephemeral: bool = False,
         ) -> None:
             if isinstance(target, discord.Interaction):
-                if target.response.is_done():
-                    msg = await target.followup.send(
-                        message, view=view, ephemeral=ephemeral
-                    )
+                channel = getattr(target, "channel", None)
+                if self._interaction_is_expired(target):
+                    msg = await channel.send(message, view=view) if channel else None
                 else:
-                    await target.response.send_message(
-                        message, view=view, ephemeral=ephemeral
-                    )
-                    msg = await target.original_response()
+                    try:
+                        if target.response.is_done():
+                            msg = await target.followup.send(
+                                message, view=view, ephemeral=ephemeral
+                            )
+                        else:
+                            await target.response.send_message(
+                                message, view=view, ephemeral=ephemeral
+                            )
+                            msg = await target.original_response()
+                    except (discord.NotFound, discord.errors.NotFound, discord.HTTPException) as exc:
+                        if getattr(exc, "code", None) not in {None, 10062}:
+                            raise
+                        try:
+                            msg = await target.followup.send(
+                                message, view=view, ephemeral=ephemeral
+                            )
+                        except Exception:
+                            msg = await channel.send(message, view=view) if channel else None
             else:
                 msg = await target.reply(message, view=view)
             view.message = msg
@@ -10536,7 +10636,8 @@ class BacktestBot(commands.Bot):
             await _send("Price invalid after rounding.", ephemeral=True)
             return
 
-        qty = usdt_amount / order_price
+        notional = usdt_amount * float(leverage)
+        qty = notional / order_price
         qty = RealtimeRunner._round_step(qty, step_size)
         if qty <= 0:
             await _send("Order size too small after symbol rounding.", ephemeral=True)
@@ -10583,7 +10684,8 @@ class BacktestBot(commands.Bot):
             f"- Symbol: {symbol}\n"
             f"- Side: {position_side}\n"
             f"- Leverage: {float(leverage):.2f}x\n"
-            f"- Amount (USDT): {usdt_amount:,.2f}\n"
+            f"- Amount (USDT, margin): {usdt_amount:,.2f}\n"
+            f"- Notional (USDT): {notional:,.2f}\n"
             f"- Qty: {qty:.6g}\n"
             f"- Order price (maker): {self._fmt_price(order_price)}\n"
             f"- Current price: {price_text}\n"

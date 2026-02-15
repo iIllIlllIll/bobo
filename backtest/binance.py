@@ -18,6 +18,9 @@ class SymbolFilters:
     max_price: Optional[float] = None
     percent_up: Optional[float] = None
     percent_down: Optional[float] = None
+    min_qty: Optional[float] = None
+    max_qty: Optional[float] = None
+    min_notional: Optional[float] = None
 
 
 class BinanceAPIError(RuntimeError):
@@ -184,10 +187,18 @@ class BinanceFuturesClient:
                 or {}
             )
             lot_filter = filters.get("LOT_SIZE") or {}
+            notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
             tick = float(price_filter.get("tickSize", 0.0))
             step = float(lot_filter.get("stepSize", 0.0))
             min_price = float(price_filter.get("minPrice", 0.0) or 0.0)
             max_price = float(price_filter.get("maxPrice", 0.0) or 0.0)
+            min_qty = float(lot_filter.get("minQty", 0.0) or 0.0)
+            max_qty = float(lot_filter.get("maxQty", 0.0) or 0.0)
+            min_notional = float(
+                notional_filter.get("notional")
+                or notional_filter.get("minNotional")
+                or 0.0
+            )
             percent_up = float(
                 percent_filter.get("multiplierUp")
                 or percent_filter.get("bidMultiplierUp")
@@ -211,6 +222,9 @@ class BinanceFuturesClient:
                 max_price=max_price if max_price > 0 else None,
                 percent_up=percent_up if percent_up > 0 else None,
                 percent_down=percent_down if percent_down > 0 else None,
+                min_qty=min_qty if min_qty > 0 else None,
+                max_qty=max_qty if max_qty > 0 else None,
+                min_notional=min_notional if min_notional > 0 else None,
             )
             self._symbol_filters[symbol] = parsed
             return parsed

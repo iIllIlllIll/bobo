@@ -73,6 +73,14 @@ def _is_post_only_reject(exc: Exception) -> bool:
     return "post only" in text or "post-only" in text or "immediately trigger" in text
 
 
+def _is_reduce_only_not_required(exc: Exception) -> bool:
+    code, msg, body = _extract_binance_error(exc)
+    if code != -1106:
+        return False
+    text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+    return "reduceonly" in text and "not required" in text
+
+
 def _is_filter_error(exc: Exception) -> bool:
     code, msg, body = _extract_binance_error(exc)
     if code in {-1013, -4016, -1111}:
@@ -597,6 +605,7 @@ class RealtimeRunner:
         filters_refreshed = False
         forced_min_price: Optional[float] = None
         forced_max_price: Optional[float] = None
+        reduce_only_param = reduce_only
         while remaining_qty > 0:
             attempt += 1
             if self.live_order_max_attempts > 0 and attempt > self.live_order_max_attempts:
@@ -653,7 +662,7 @@ class RealtimeRunner:
                     side,
                     qty_param,
                     price_param,
-                    reduce_only,
+                    reduce_only_param,
                     position_side,
                     )
             except Exception as exc:
@@ -671,6 +680,9 @@ class RealtimeRunner:
                             if forced_max_price is None
                             else min(forced_max_price, bound_max)
                         )
+                    continue
+                if _is_reduce_only_not_required(exc) and reduce_only_param:
+                    reduce_only_param = False
                     continue
                 if _is_filter_error(exc) and not filters_refreshed:
                     filters_refreshed = True
