@@ -4,11 +4,12 @@ import asyncio
 import json
 import math
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -73,7 +74,7 @@ def _is_post_only_reject(exc: Exception) -> bool:
 
 def _is_filter_error(exc: Exception) -> bool:
     code, msg, body = _extract_binance_error(exc)
-    if code in {-1013}:
+    if code in {-1013, -4016}:
         return True
     text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
     return (
@@ -83,7 +84,21 @@ def _is_filter_error(exc: Exception) -> bool:
         or "filter" in text
         or "invalid price" in text
         or "invalid quantity" in text
+        or "limit price can't be higher" in text
+        or "limit price can't be lower" in text
     )
+
+
+def _extract_limit_price_bound(
+    exc: Exception,
+) -> tuple[Optional[float], Optional[float]]:
+    _, msg, body = _extract_binance_error(exc)
+    text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+    upper_match = re.search(r"limit price can't be higher than\s*([0-9]*\.?[0-9]+)", text)
+    lower_match = re.search(r"limit price can't be lower than\s*([0-9]*\.?[0-9]+)", text)
+    upper = float(upper_match.group(1)) if upper_match else None
+    lower = float(lower_match.group(1)) if lower_match else None
+    return lower, upper
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -578,19 +593,31 @@ class RealtimeRunner:
         attempt = 0
         post_only_rejects = 0
         filters_refreshed = False
+        forced_min_price: Optional[float] = None
+        forced_max_price: Optional[float] = None
         while remaining_qty > 0:
             attempt += 1
             if self.live_order_max_attempts > 0 and attempt > self.live_order_max_attempts:
                 return
 
             target_price = price
+            reference_price = price
             if attempt > 1:
                 try:
                     target_price = await asyncio.to_thread(
                         self.binance.get_price, self.symbol
                     )
+                    reference_price = target_price
                 except Exception:
                     target_price = price
+                    reference_price = target_price
+            else:
+                try:
+                    reference_price = await asyncio.to_thread(
+                        self.binance.get_price, self.symbol
+                    )
+                except Exception:
+                    reference_price = target_price
             adjusted_price = self._maker_price(float(target_price), side)
             adjusted_price = self._round_price(adjusted_price, tick_size, side)
             if post_only_rejects > 0:
@@ -602,6 +629,16 @@ class RealtimeRunner:
                         else adjusted_price + (nudge * post_only_rejects)
                     )
                     adjusted_price = self._round_price(adjusted_price, tick_size, side)
+            adjusted_price = self._round_price_with_bounds(
+                adjusted_price,
+                tick_size,
+                side,
+                *self._merge_price_bounds(
+                    self._price_bounds(float(reference_price), self._symbol_filters),
+                    forced_min_price,
+                    forced_max_price,
+                ),
+            )
             if adjusted_price <= 0:
                 return
 
@@ -614,8 +651,23 @@ class RealtimeRunner:
                     adjusted_price,
                     reduce_only,
                     position_side,
-                )
+                    )
             except Exception as exc:
+                bound_min, bound_max = _extract_limit_price_bound(exc)
+                if bound_min is not None or bound_max is not None:
+                    if bound_min is not None:
+                        forced_min_price = (
+                            bound_min
+                            if forced_min_price is None
+                            else max(forced_min_price, bound_min)
+                        )
+                    if bound_max is not None:
+                        forced_max_price = (
+                            bound_max
+                            if forced_max_price is None
+                            else min(forced_max_price, bound_max)
+                        )
+                    continue
                 if _is_filter_error(exc) and not filters_refreshed:
                     filters_refreshed = True
                     try:
@@ -671,6 +723,19 @@ class RealtimeRunner:
             remaining_qty = max(remaining_qty - executed_qty, 0.0)
             remaining_qty = self._round_step(remaining_qty, step_size)
             self._last_exchange_sync = None
+
+    @staticmethod
+    def _merge_price_bounds(
+        base_bounds: Tuple[Optional[float], Optional[float]],
+        forced_min: Optional[float],
+        forced_max: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        min_price, max_price = base_bounds
+        if forced_min is not None:
+            min_price = forced_min if min_price is None else max(min_price, forced_min)
+        if forced_max is not None:
+            max_price = forced_max if max_price is None else min(max_price, forced_max)
+        return min_price, max_price
 
     def _should_sync_exchange(self) -> bool:
         if not self.sync_exchange_positions:
@@ -922,3 +987,51 @@ class RealtimeRunner:
         if side.upper() == "BUY":
             return math.floor(value / tick) * tick
         return math.ceil(value / tick) * tick
+
+    @staticmethod
+    def _round_price_with_bounds(
+        value: float,
+        tick: float,
+        side: str,
+        min_price: Optional[float],
+        max_price: Optional[float],
+    ) -> float:
+        if value <= 0:
+            return value
+        if min_price is not None and value < min_price:
+            value = min_price
+        if max_price is not None and value > max_price:
+            value = max_price
+        if tick <= 0:
+            return value
+        side_up = side.upper()
+        if side_up == "BUY":
+            rounded = math.floor(value / tick) * tick
+        else:
+            rounded = math.ceil(value / tick) * tick
+        if max_price is not None and rounded > max_price:
+            rounded = math.floor(max_price / tick) * tick
+        if min_price is not None and rounded < min_price:
+            rounded = math.ceil(min_price / tick) * tick
+        if min_price is not None and rounded < min_price:
+            rounded = min_price
+        if max_price is not None and rounded > max_price:
+            rounded = max_price
+        return rounded
+
+    @staticmethod
+    def _price_bounds(
+        reference_price: float, filters: Optional[SymbolFilters]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if filters is None:
+            return None, None
+        min_price = filters.min_price
+        max_price = filters.max_price
+        if reference_price > 0:
+            if filters.percent_down is not None and filters.percent_down > 0:
+                candidate = reference_price * filters.percent_down
+                min_price = candidate if min_price is None else max(min_price, candidate)
+            if filters.percent_up is not None and filters.percent_up > 0:
+                candidate = reference_price * filters.percent_up
+                max_price = candidate if max_price is None else min(max_price, candidate)
+        return min_price, max_price

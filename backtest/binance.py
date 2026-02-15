@@ -14,6 +14,10 @@ from urllib.parse import urlencode
 class SymbolFilters:
     tick_size: float
     step_size: float
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    percent_up: Optional[float] = None
+    percent_down: Optional[float] = None
 
 
 class BinanceAPIError(RuntimeError):
@@ -174,14 +178,40 @@ class BinanceFuturesClient:
                 continue
             filters = {item.get("filterType"): item for item in entry.get("filters", [])}
             price_filter = filters.get("PRICE_FILTER") or {}
+            percent_filter = (
+                filters.get("PERCENT_PRICE")
+                or filters.get("PERCENT_PRICE_BY_SIDE")
+                or {}
+            )
             lot_filter = filters.get("LOT_SIZE") or {}
             tick = float(price_filter.get("tickSize", 0.0))
             step = float(lot_filter.get("stepSize", 0.0))
+            min_price = float(price_filter.get("minPrice", 0.0) or 0.0)
+            max_price = float(price_filter.get("maxPrice", 0.0) or 0.0)
+            percent_up = float(
+                percent_filter.get("multiplierUp")
+                or percent_filter.get("bidMultiplierUp")
+                or percent_filter.get("askMultiplierUp")
+                or 0.0
+            )
+            percent_down = float(
+                percent_filter.get("multiplierDown")
+                or percent_filter.get("bidMultiplierDown")
+                or percent_filter.get("askMultiplierDown")
+                or 0.0
+            )
             if tick <= 0:
                 tick = 0.01
             if step <= 0:
                 step = 0.001
-            parsed = SymbolFilters(tick_size=tick, step_size=step)
+            parsed = SymbolFilters(
+                tick_size=tick,
+                step_size=step,
+                min_price=min_price if min_price > 0 else None,
+                max_price=max_price if max_price > 0 else None,
+                percent_up=percent_up if percent_up > 0 else None,
+                percent_down=percent_down if percent_down > 0 else None,
+            )
             self._symbol_filters[symbol] = parsed
             return parsed
         raise ValueError(f"Symbol not found in exchange info: {symbol}")

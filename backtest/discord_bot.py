@@ -5483,6 +5483,25 @@ class BacktestBot(commands.Bot):
         return price * (1.0 + offset)
 
     @staticmethod
+    def _price_bounds(
+        reference_price: float, filters: Optional[Any]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if filters is None:
+            return None, None
+        min_price = getattr(filters, "min_price", None)
+        max_price = getattr(filters, "max_price", None)
+        percent_down = getattr(filters, "percent_down", None)
+        percent_up = getattr(filters, "percent_up", None)
+        if reference_price > 0:
+            if percent_down is not None and percent_down > 0:
+                candidate = reference_price * percent_down
+                min_price = candidate if min_price is None else max(min_price, candidate)
+            if percent_up is not None and percent_up > 0:
+                candidate = reference_price * percent_up
+                max_price = candidate if max_price is None else min(max_price, candidate)
+        return min_price, max_price
+
+    @staticmethod
     def _extract_binance_error(
         exc: Exception,
     ) -> tuple[Optional[int], Optional[str], Optional[str]]:
@@ -5532,7 +5551,7 @@ class BacktestBot(commands.Bot):
     @classmethod
     def _is_filter_error(cls, exc: Exception) -> bool:
         code, msg, body = cls._extract_binance_error(exc)
-        if code in {-1013}:
+        if code in {-1013, -4016}:
             return True
         text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
         return (
@@ -5542,7 +5561,34 @@ class BacktestBot(commands.Bot):
             or "filter" in text
             or "invalid price" in text
             or "invalid quantity" in text
+            or "limit price can't be higher" in text
+            or "limit price can't be lower" in text
         )
+
+    @classmethod
+    def _extract_limit_price_bound(
+        cls, exc: Exception
+    ) -> Tuple[Optional[float], Optional[float]]:
+        _, msg, body = cls._extract_binance_error(exc)
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        upper_match = re.search(r"limit price can't be higher than\s*([0-9]*\.?[0-9]+)", text)
+        lower_match = re.search(r"limit price can't be lower than\s*([0-9]*\.?[0-9]+)", text)
+        upper = float(upper_match.group(1)) if upper_match else None
+        lower = float(lower_match.group(1)) if lower_match else None
+        return lower, upper
+
+    @staticmethod
+    def _merge_price_bounds(
+        base_bounds: Tuple[Optional[float], Optional[float]],
+        forced_min: Optional[float],
+        forced_max: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        min_price, max_price = base_bounds
+        if forced_min is not None:
+            min_price = forced_min if min_price is None else max(min_price, forced_min)
+        if forced_max is not None:
+            max_price = forced_max if max_price is None else min(max_price, forced_max)
+        return min_price, max_price
 
     async def _ensure_hedge_and_isolated(
         self,
@@ -5636,6 +5682,7 @@ class BacktestBot(commands.Bot):
     ) -> Dict[str, Any]:
         tick_size = 0.0
         step_size = 0.0
+        filters: Optional[Any] = None
         try:
             filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
             tick_size = filters.tick_size
@@ -5657,24 +5704,33 @@ class BacktestBot(commands.Bot):
         post_only_rejects = 0
         filters_refreshed = False
         last_error_note: Optional[str] = None
+        forced_min_price: Optional[float] = None
+        forced_max_price: Optional[float] = None
         while remaining_qty > 0:
             attempt += 1
             if max_attempts > 0 and attempt > max_attempts:
                 break
 
             target_price = base_price
+            reference_price = base_price
             if attempt > 1:
                 try:
                     target_price = float(
                         await asyncio.to_thread(client.get_price, symbol)
                     )
+                    reference_price = target_price
                 except Exception:
                     target_price = base_price
+                    reference_price = target_price
+            else:
+                try:
+                    reference_price = float(
+                        await asyncio.to_thread(client.get_price, symbol)
+                    )
+                except Exception:
+                    reference_price = target_price
             adjusted_price = self._apply_maker_offset(
                 float(target_price), side, maker_offset_bps
-            )
-            adjusted_price = RealtimeRunner._round_price(
-                adjusted_price, tick_size, side
             )
             if post_only_rejects > 0:
                 nudge = tick_size if tick_size > 0 else adjusted_price * 0.0001
@@ -5684,9 +5740,14 @@ class BacktestBot(commands.Bot):
                         if side.upper() == "BUY"
                         else adjusted_price + (nudge * post_only_rejects)
                     )
-                    adjusted_price = RealtimeRunner._round_price(
-                        adjusted_price, tick_size, side
-                    )
+            min_price, max_price = self._merge_price_bounds(
+                self._price_bounds(float(reference_price), filters),
+                forced_min_price,
+                forced_max_price,
+            )
+            adjusted_price = RealtimeRunner._round_price_with_bounds(
+                adjusted_price, tick_size, side, min_price, max_price
+            )
             if adjusted_price <= 0:
                 return {
                     "filled": False,
@@ -5706,6 +5767,22 @@ class BacktestBot(commands.Bot):
                     position_side,
                 )
             except Exception as exc:
+                bound_min, bound_max = self._extract_limit_price_bound(exc)
+                if bound_min is not None or bound_max is not None:
+                    if bound_min is not None:
+                        forced_min_price = (
+                            bound_min
+                            if forced_min_price is None
+                            else max(forced_min_price, bound_min)
+                        )
+                    if bound_max is not None:
+                        forced_max_price = (
+                            bound_max
+                            if forced_max_price is None
+                            else min(forced_max_price, bound_max)
+                        )
+                    last_error_note = f"Order failed: {self._format_binance_error(exc)}"
+                    continue
                 if self._is_filter_error(exc) and not filters_refreshed:
                     filters_refreshed = True
                     try:
@@ -10432,14 +10509,22 @@ class BacktestBot(commands.Bot):
 
         tick_size = 0.0
         step_size = 0.0
+        min_price = None
+        max_price = None
         try:
             filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
             tick_size = filters.tick_size
             step_size = filters.step_size
+            min_price, max_price = self._price_bounds(
+                float(current_price), filters
+            )
         except Exception:
             pass
 
-        order_price = RealtimeRunner._round_price(order_price, tick_size, side)
+        raw_order_price = order_price
+        order_price = RealtimeRunner._round_price_with_bounds(
+            order_price, tick_size, side, min_price, max_price
+        )
         if order_price <= 0:
             await _send("Price invalid after rounding.", ephemeral=True)
             return
@@ -10462,16 +10547,30 @@ class BacktestBot(commands.Bot):
             maker_offset_bps=maker_offset_bps,
         )
 
-        warning = ""
+        warnings: List[str] = []
+        if (
+            (min_price is not None or max_price is not None)
+            and abs(order_price - raw_order_price) > 1e-12
+        ):
+            bound_parts: List[str] = []
+            if min_price is not None:
+                bound_parts.append(f"min {self._fmt_price(min_price)}")
+            if max_price is not None:
+                bound_parts.append(f"max {self._fmt_price(max_price)}")
+            bounds_text = ", ".join(bound_parts)
+            warnings.append(
+                f"Note: price adjusted to exchange bounds ({bounds_text})."
+            )
         if available is not None and usdt_amount > available:
-            warning = (
-                f"\nWarning: amount {usdt_amount:,.2f} exceeds available "
+            warnings.append(
+                f"Warning: amount {usdt_amount:,.2f} exceeds available "
                 f"{available:,.2f} USDT."
             )
 
         available_text = f"{available:,.2f}" if available is not None else "n/a"
         wallet_text = f"{wallet:,.2f}" if wallet is not None else "n/a"
         price_text = self._fmt_price(current_price if current_price is not None else price)
+        warnings_text = "\n".join(warnings) if warnings else ""
         confirm_text = (
             "Live futures order preview\n"
             f"- Symbol: {symbol}\n"
@@ -10484,7 +10583,7 @@ class BacktestBot(commands.Bot):
             f"- Available USDT: {available_text} (wallet {wallet_text})\n"
             "- Margin: ISOLATED\n"
             "- Mode: HEDGE"
-            f"{warning}"
+            + (f"\n{warnings_text}" if warnings_text else "")
         )
         if note:
             confirm_text = f"{confirm_text}\nNote: {note}"
