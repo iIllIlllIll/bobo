@@ -5551,7 +5551,7 @@ class BacktestBot(commands.Bot):
     @classmethod
     def _is_filter_error(cls, exc: Exception) -> bool:
         code, msg, body = cls._extract_binance_error(exc)
-        if code in {-1013, -4016}:
+        if code in {-1013, -4016, -1111}:
             return True
         text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
         return (
@@ -5561,6 +5561,7 @@ class BacktestBot(commands.Bot):
             or "filter" in text
             or "invalid price" in text
             or "invalid quantity" in text
+            or "precision is over the maximum defined" in text
             or "limit price can't be higher" in text
             or "limit price can't be lower" in text
         )
@@ -5757,12 +5758,14 @@ class BacktestBot(commands.Bot):
                 }
 
             try:
+                qty_param = RealtimeRunner._format_by_step(remaining_qty, step_size)
+                price_param = RealtimeRunner._format_by_step(adjusted_price, tick_size)
                 order = await asyncio.to_thread(
                     client.place_limit_maker,
                     symbol,
                     side,
-                    remaining_qty,
-                    adjusted_price,
+                    qty_param,
+                    price_param,
                     reduce_only,
                     position_side,
                 )

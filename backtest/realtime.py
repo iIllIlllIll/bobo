@@ -6,6 +6,7 @@ import math
 import logging
 import re
 import time
+from decimal import Decimal
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,7 +75,7 @@ def _is_post_only_reject(exc: Exception) -> bool:
 
 def _is_filter_error(exc: Exception) -> bool:
     code, msg, body = _extract_binance_error(exc)
-    if code in {-1013, -4016}:
+    if code in {-1013, -4016, -1111}:
         return True
     text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
     return (
@@ -84,6 +85,7 @@ def _is_filter_error(exc: Exception) -> bool:
         or "filter" in text
         or "invalid price" in text
         or "invalid quantity" in text
+        or "precision is over the maximum defined" in text
         or "limit price can't be higher" in text
         or "limit price can't be lower" in text
     )
@@ -643,12 +645,14 @@ class RealtimeRunner:
                 return
 
             try:
+                qty_param = self._format_by_step(remaining_qty, step_size)
+                price_param = self._format_by_step(adjusted_price, tick_size)
                 order = await asyncio.to_thread(
                     self.binance.place_limit_maker,
                     self.symbol,
                     side,
-                    remaining_qty,
-                    adjusted_price,
+                    qty_param,
+                    price_param,
                     reduce_only,
                     position_side,
                     )
@@ -979,6 +983,23 @@ class RealtimeRunner:
         if step <= 0:
             return value
         return math.floor(value / step) * step
+
+    @staticmethod
+    def _precision_from_step(step: float) -> int:
+        if step <= 0:
+            return 0
+        try:
+            exp = Decimal(str(step)).as_tuple().exponent
+        except Exception:
+            return 0
+        return max(-exp, 0)
+
+    @classmethod
+    def _format_by_step(cls, value: float, step: float) -> str:
+        if step <= 0:
+            return str(value)
+        precision = cls._precision_from_step(step)
+        return f"{value:.{precision}f}"
 
     @staticmethod
     def _round_price(value: float, tick: float, side: str) -> float:
