@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from backtest.binance import BinanceFuturesClient, SymbolFilters
+from backtest.binance import BinanceAPIError, BinanceFuturesClient, SymbolFilters
 from backtest.engine import BacktestEngine
 from backtest.runner import _normalize_cheatkey_params
 from backtest.strategy_loader import get_strategy_class
@@ -38,6 +38,52 @@ def _format_http_error(exc: Exception) -> str:
     if body:
         return f" body={body}"
     return ""
+
+
+def _extract_binance_error(exc: Exception) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    if isinstance(exc, BinanceAPIError):
+        return exc.code, exc.msg, exc.response_text
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None, None, None
+    code = None
+    msg = None
+    body = None
+    try:
+        payload = resp.json()
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            msg = payload.get("msg")
+    except Exception:
+        pass
+    try:
+        body = resp.text
+    except Exception:
+        body = None
+    return code, msg, body
+
+
+def _is_post_only_reject(exc: Exception) -> bool:
+    code, msg, body = _extract_binance_error(exc)
+    if code in {-5022, -2010}:
+        return True
+    text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+    return "post only" in text or "post-only" in text or "immediately trigger" in text
+
+
+def _is_filter_error(exc: Exception) -> bool:
+    code, msg, body = _extract_binance_error(exc)
+    if code in {-1013}:
+        return True
+    text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+    return (
+        "price_filter" in text
+        or "lot_size" in text
+        or "min_notional" in text
+        or "filter" in text
+        or "invalid price" in text
+        or "invalid quantity" in text
+    )
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -126,6 +172,7 @@ class RealtimeRunner:
         sync_history_path: Optional[str] = None,
         live_order_retry_seconds: float = 30.0,
         live_order_max_attempts: int = 0,
+        dual_side_position: Optional[bool] = None,
         on_trade: Optional[Callable[[str, Dict[str, Any], pd.DataFrame], None]] = None,
         on_payload: Optional[Callable[[str, RunnerPayload], None]] = None,
     ) -> None:
@@ -153,6 +200,7 @@ class RealtimeRunner:
         self.sync_history_path = sync_history_path
         self.live_order_retry_seconds = live_order_retry_seconds
         self.live_order_max_attempts = live_order_max_attempts
+        self._dual_side_position = dual_side_position
         self.on_trade = on_trade
         self.on_payload = on_payload
         self._task: Optional[asyncio.Task] = None
@@ -473,6 +521,20 @@ class RealtimeRunner:
         pnl_unlevered = (target_price_f - entry_price) / entry_price * direction
         return pnl_unlevered * leverage * 100.0
 
+    async def _ensure_dual_side_position(self) -> Optional[bool]:
+        if self._dual_side_position is not None:
+            return self._dual_side_position
+        if self.binance is None:
+            return None
+        try:
+            payload = await asyncio.to_thread(self.binance.get_position_mode)
+        except Exception:
+            return None
+        if isinstance(payload, dict):
+            self._dual_side_position = bool(payload.get("dualSidePosition"))
+            return self._dual_side_position
+        return None
+
     async def _submit_live_order(self, trade: Dict[str, Any]) -> None:
         trade_type = trade.get("type")
         if trade_type not in {"entry", "exit", "exit_partial"}:
@@ -491,10 +553,13 @@ class RealtimeRunner:
 
         side = "BUY" if direction > 0 else "SELL"
         reduce_only = False
-        position_side = "LONG" if direction > 0 else "SHORT"
+        position_side = None
         if trade_type in {"exit", "exit_partial"}:
             reduce_only = True
             side = "SELL" if direction > 0 else "BUY"
+        dual_side = await self._ensure_dual_side_position()
+        if dual_side:
+            position_side = "LONG" if direction > 0 else "SHORT"
 
         if self._symbol_filters is None:
             try:
@@ -511,6 +576,8 @@ class RealtimeRunner:
             return
 
         attempt = 0
+        post_only_rejects = 0
+        filters_refreshed = False
         while remaining_qty > 0:
             attempt += 1
             if self.live_order_max_attempts > 0 and attempt > self.live_order_max_attempts:
@@ -526,6 +593,15 @@ class RealtimeRunner:
                     target_price = price
             adjusted_price = self._maker_price(float(target_price), side)
             adjusted_price = self._round_price(adjusted_price, tick_size, side)
+            if post_only_rejects > 0:
+                nudge = tick_size if tick_size > 0 else adjusted_price * 0.0001
+                if nudge > 0:
+                    adjusted_price = (
+                        adjusted_price - (nudge * post_only_rejects)
+                        if side.upper() == "BUY"
+                        else adjusted_price + (nudge * post_only_rejects)
+                    )
+                    adjusted_price = self._round_price(adjusted_price, tick_size, side)
             if adjusted_price <= 0:
                 return
 
@@ -539,7 +615,25 @@ class RealtimeRunner:
                     reduce_only,
                     position_side,
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_filter_error(exc) and not filters_refreshed:
+                    filters_refreshed = True
+                    try:
+                        self._symbol_filters = await asyncio.to_thread(
+                            self.binance.get_symbol_filters, self.symbol
+                        )
+                        if self._symbol_filters:
+                            tick_size = self._symbol_filters.tick_size
+                            step_size = self._symbol_filters.step_size
+                            remaining_qty = self._round_step(remaining_qty, step_size)
+                            if remaining_qty <= 0:
+                                return
+                    except Exception:
+                        pass
+                    continue
+                if _is_post_only_reject(exc):
+                    post_only_rejects += 1
+                    continue
                 return
 
             if self.live_order_retry_seconds <= 0:

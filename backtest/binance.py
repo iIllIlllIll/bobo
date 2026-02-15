@@ -150,6 +150,9 @@ class BinanceFuturesClient:
             signed=True,
         )
 
+    def get_position_mode(self) -> Any:
+        return self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+
     def get_account(self) -> Any:
         return self._request("GET", "/fapi/v2/account", signed=True)
 
@@ -200,10 +203,13 @@ class BinanceFuturesClient:
             "timeInForce": "GTX",
             "quantity": qty,
             "price": price,
-            "reduceOnly": "true" if reduce_only else "false",
         }
+        if reduce_only:
+            params["reduceOnly"] = "true"
         if position_side:
-            params["positionSide"] = position_side.upper()
+            side_value = position_side.upper()
+            if side_value in {"LONG", "SHORT"}:
+                params["positionSide"] = side_value
         return self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
     def get_order(

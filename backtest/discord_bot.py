@@ -4490,6 +4490,7 @@ class BacktestBot(commands.Bot):
             logger.warning("Live runner missing api_key/api_secret; skipping live start.")
             return None
         binance = BinanceFuturesClient(api_key, api_secret)
+        dual_side_position: Optional[bool] = None
         if group == "live" and auto_trade:
             def _is_noop_position_mode(exc: Exception) -> bool:
                 code, msg, body = self._extract_binance_error(exc)
@@ -4511,12 +4512,15 @@ class BacktestBot(commands.Bot):
 
             try:
                 binance.set_position_mode(True)
+                dual_side_position = True
             except Exception as exc:
                 if not _is_noop_position_mode(exc):
                     logger.warning(
                         "Live hedge mode setup failed: %s",
                         self._format_binance_error(exc),
                     )
+                else:
+                    dual_side_position = True
             try:
                 binance.set_margin_type(symbol, "ISOLATED")
             except Exception as exc:
@@ -4530,6 +4534,12 @@ class BacktestBot(commands.Bot):
                     binance.set_leverage(symbol, int(leverage))
                 except Exception:
                     pass
+            try:
+                payload = binance.get_position_mode()
+                if isinstance(payload, dict):
+                    dual_side_position = bool(payload.get("dualSidePosition"))
+            except Exception:
+                pass
 
         strategy_name = "cheatkey"
         strategy_params = {}
@@ -4569,6 +4579,7 @@ class BacktestBot(commands.Bot):
             sync_history_path=sync_history_path,
             live_order_retry_seconds=live_order_retry_seconds,
             live_order_max_attempts=live_order_max_attempts,
+            dual_side_position=dual_side_position,
             on_trade=on_trade,
             on_payload=on_payload,
         )
@@ -5510,6 +5521,29 @@ class BacktestBot(commands.Bot):
             return ", ".join(parts)
         return str(exc)
 
+    @classmethod
+    def _is_post_only_reject(cls, exc: Exception) -> bool:
+        code, msg, body = cls._extract_binance_error(exc)
+        if code in {-5022, -2010}:
+            return True
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        return "post only" in text or "post-only" in text or "immediately trigger" in text
+
+    @classmethod
+    def _is_filter_error(cls, exc: Exception) -> bool:
+        code, msg, body = cls._extract_binance_error(exc)
+        if code in {-1013}:
+            return True
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        return (
+            "price_filter" in text
+            or "lot_size" in text
+            or "min_notional" in text
+            or "filter" in text
+            or "invalid price" in text
+            or "invalid quantity" in text
+        )
+
     async def _ensure_hedge_and_isolated(
         self,
         client: BinanceFuturesClient,
@@ -5552,9 +5586,16 @@ class BacktestBot(commands.Bot):
             if _is_noop_position_mode(exc):
                 hedge_ok = True
             else:
-                notes.append(
-                    f"Failed to set hedge mode: {self._format_binance_error(exc)}"
-                )
+                try:
+                    payload = await asyncio.to_thread(client.get_position_mode)
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict) and payload.get("dualSidePosition") is True:
+                    hedge_ok = True
+                else:
+                    notes.append(
+                        f"Failed to set hedge mode: {self._format_binance_error(exc)}"
+                    )
         isolated_ok = False
         try:
             await asyncio.to_thread(client.set_margin_type, symbol, "ISOLATED")
@@ -5563,9 +5604,21 @@ class BacktestBot(commands.Bot):
             if _is_noop_margin_type(exc):
                 isolated_ok = True
             else:
-                notes.append(
-                    f"Failed to set isolated margin: {self._format_binance_error(exc)}"
-                )
+                try:
+                    payload = await asyncio.to_thread(client.get_position_risk, symbol)
+                except Exception:
+                    payload = None
+                margin_type = None
+                if isinstance(payload, list) and payload:
+                    margin_type = payload[0].get("marginType")
+                elif isinstance(payload, dict):
+                    margin_type = payload.get("marginType")
+                if isinstance(margin_type, str) and margin_type.upper() == "ISOLATED":
+                    isolated_ok = True
+                else:
+                    notes.append(
+                        f"Failed to set isolated margin: {self._format_binance_error(exc)}"
+                    )
         return notes, hedge_ok, isolated_ok
 
     async def _place_limit_maker_with_retry(
@@ -5601,6 +5654,9 @@ class BacktestBot(commands.Bot):
 
         attempt = 0
         last_order_id: Optional[int] = None
+        post_only_rejects = 0
+        filters_refreshed = False
+        last_error_note: Optional[str] = None
         while remaining_qty > 0:
             attempt += 1
             if max_attempts > 0 and attempt > max_attempts:
@@ -5620,6 +5676,17 @@ class BacktestBot(commands.Bot):
             adjusted_price = RealtimeRunner._round_price(
                 adjusted_price, tick_size, side
             )
+            if post_only_rejects > 0:
+                nudge = tick_size if tick_size > 0 else adjusted_price * 0.0001
+                if nudge > 0:
+                    adjusted_price = (
+                        adjusted_price - (nudge * post_only_rejects)
+                        if side.upper() == "BUY"
+                        else adjusted_price + (nudge * post_only_rejects)
+                    )
+                    adjusted_price = RealtimeRunner._round_price(
+                        adjusted_price, tick_size, side
+                    )
             if adjusted_price <= 0:
                 return {
                     "filled": False,
@@ -5639,6 +5706,32 @@ class BacktestBot(commands.Bot):
                     position_side,
                 )
             except Exception as exc:
+                if self._is_filter_error(exc) and not filters_refreshed:
+                    filters_refreshed = True
+                    try:
+                        filters = await asyncio.to_thread(
+                            client.get_symbol_filters, symbol
+                        )
+                        tick_size = filters.tick_size
+                        step_size = filters.step_size
+                        remaining_qty = RealtimeRunner._round_step(
+                            remaining_qty, step_size
+                        )
+                        if remaining_qty <= 0:
+                            return {
+                                "filled": False,
+                                "remaining_qty": remaining_qty,
+                                "order_id": last_order_id,
+                                "note": "Quantity too small after rounding.",
+                            }
+                    except Exception:
+                        pass
+                    last_error_note = f"Order failed: {self._format_binance_error(exc)}"
+                    continue
+                if self._is_post_only_reject(exc):
+                    post_only_rejects += 1
+                    last_error_note = f"Order failed: {self._format_binance_error(exc)}"
+                    continue
                 return {
                     "filled": False,
                     "remaining_qty": remaining_qty,
@@ -5695,7 +5788,7 @@ class BacktestBot(commands.Bot):
             "filled": False,
             "remaining_qty": remaining_qty,
             "order_id": last_order_id,
-            "note": "Order not fully filled after retries.",
+            "note": last_error_note or "Order not fully filled after retries.",
         }
 
     async def _execute_live_order(
