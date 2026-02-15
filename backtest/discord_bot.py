@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Any, Dict, List, Sequence, Tuple, Callable, Union
+from typing import Optional, Any, Dict, List, Sequence, Tuple, Callable, Union, Set
 
 import discord
 import numpy as np
@@ -10230,15 +10230,38 @@ class BacktestBot(commands.Bot):
             qty = abs(position_amt)
             entry_price = item.get("entryPrice", "n/a")
             mark_price = item.get("markPrice", "n/a")
-            leverage = item.get("leverage", "n/a")
+            leverage_raw = item.get("leverage", "n/a")
+            try:
+                leverage_value = float(leverage_raw)
+            except (TypeError, ValueError):
+                leverage_value = 0.0
             liq_price = item.get("liquidationPrice", "n/a")
+            notional = 0.0
+            try:
+                notional = abs(float(item.get("notional", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                notional = 0.0
+            margin = 0.0
+            try:
+                margin = float(item.get("isolatedMargin", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                margin = 0.0
+            if margin <= 0:
+                try:
+                    margin = float(item.get("positionInitialMargin", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    margin = 0.0
+            if margin <= 0 and leverage_value > 0 and notional > 0:
+                margin = notional / leverage_value
             unreal = float(item.get("unRealizedProfit", 0.0) or 0.0)
             total_unreal += unreal
             count += 1
+            lev_text = f"{leverage_value:g}" if leverage_value > 0 else str(leverage_raw)
+            margin_text = f"{margin:,.2f}" if margin > 0 else "n/a"
             line = (
                 f"{symbol} {position_side} | qty {qty:.6g} | entry {self._fmt_price(entry_price)} "
-                f"| mark {self._fmt_price(mark_price)} | pnl {unreal:+,.2f} | lev {leverage}x "
-                f"| liq {self._fmt_price(liq_price)}"
+                f"| mark {self._fmt_price(mark_price)} | pnl {unreal:+,.2f} | lev {lev_text}x "
+                f"| margin {margin_text} | liq {self._fmt_price(liq_price)}"
             )
             lines.append(line)
 
@@ -10543,46 +10566,98 @@ class BacktestBot(commands.Bot):
             await _send("Side must be long/short (or buy/sell).", ephemeral=True)
             return
 
-        try:
-            usdt_amount = float(tokens[1].replace(",", ""))
-        except ValueError:
-            await _send("USDT amount must be a number.", ephemeral=True)
-            return
-        if usdt_amount <= 0:
-            await _send("USDT amount must be greater than 0.", ephemeral=True)
-            return
+        def _extract_float(text: str) -> Optional[float]:
+            match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text.replace(",", ""))
+            if not match:
+                return None
+            try:
+                return float(match.group(0))
+            except ValueError:
+                return None
 
+        amount: Optional[float] = None
         price: Optional[float] = None
         symbol: Optional[str] = None
         leverage: Optional[float] = None
 
-        for token in tokens[2:]:
+        side_tokens = {
+            "buy",
+            "sell",
+            "long",
+            "short",
+            "l",
+            "s",
+            "b",
+        }
+        leverage_tokens = {"leverage", "lev", "레버리지"}
+        amount_tokens = {"usdt", "usd", "amount", "원금", "증거금"}
+        skip_indices: Set[int] = set()
+
+        for idx, token in enumerate(tokens):
+            if token.lower() in side_tokens:
+                skip_indices.add(idx)
+
+        for idx, token in enumerate(tokens):
+            if idx in skip_indices:
+                continue
             text = token.strip()
             if not text:
                 continue
             lower = text.lower()
             if lower.endswith("x") and leverage is None:
-                try:
-                    leverage = float(lower[:-1])
+                parsed = _extract_float(lower[:-1])
+                if parsed is not None:
+                    leverage = parsed
                     continue
-                except ValueError:
-                    pass
+            if any(key in lower for key in leverage_tokens) and leverage is None:
+                parsed = _extract_float(text)
+                if parsed is None and idx + 1 < len(tokens):
+                    parsed = _extract_float(tokens[idx + 1])
+                    if parsed is not None:
+                        skip_indices.add(idx + 1)
+                if parsed is not None:
+                    leverage = parsed
+                    continue
+            if any(key in lower for key in amount_tokens) and amount is None:
+                parsed = _extract_float(text)
+                if parsed is None and idx + 1 < len(tokens):
+                    parsed = _extract_float(tokens[idx + 1])
+                    if parsed is not None:
+                        skip_indices.add(idx + 1)
+                if parsed is not None:
+                    amount = parsed
+                    continue
+
+        for idx, token in enumerate(tokens):
+            if idx in skip_indices:
+                continue
+            text = token.strip()
+            if not text:
+                continue
             if _looks_like_symbol(text) and symbol is None:
-                symbol = text.replace("/", "").replace("-", "").upper()
+                lower = text.lower()
+                if lower not in amount_tokens and not any(key in lower for key in leverage_tokens):
+                    symbol = text.replace("/", "").replace("-", "").upper()
+                    continue
+            parsed = _extract_float(text)
+            if parsed is None:
+                continue
+            if amount is None:
+                amount = parsed
                 continue
             if price is None:
-                try:
-                    price = float(text.replace(",", ""))
-                    continue
-                except ValueError:
-                    pass
+                price = parsed
+                continue
             if leverage is None:
-                try:
-                    leverage = float(text.replace(",", ""))
-                    continue
-                except ValueError:
-                    pass
-            await _send(f"Unrecognized token: `{text}`", ephemeral=True)
+                leverage = parsed
+                continue
+
+        if amount is None:
+            await _send("USDT amount must be a number.", ephemeral=True)
+            return
+        usdt_amount = amount
+        if usdt_amount <= 0:
+            await _send("USDT amount must be greater than 0.", ephemeral=True)
             return
 
         if symbol is None:
