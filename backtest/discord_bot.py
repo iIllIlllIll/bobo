@@ -612,6 +612,8 @@ class LiveOrderConfirmView(View):
                 ephemeral=True,
             )
             return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         for item in self.children:
             item.disabled = True
         if self.message:
@@ -744,6 +746,8 @@ class ClosePositionConfirmView(View):
                 ephemeral=True,
             )
             return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         for item in self.children:
             item.disabled = True
         if self.message:
