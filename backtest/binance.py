@@ -16,6 +16,30 @@ class SymbolFilters:
     step_size: float
 
 
+class BinanceAPIError(RuntimeError):
+    def __init__(
+        self,
+        status: int,
+        code: Optional[int] = None,
+        msg: Optional[str] = None,
+        url: Optional[str] = None,
+        response_text: Optional[str] = None,
+    ) -> None:
+        self.status = status
+        self.code = code
+        self.msg = msg
+        self.url = url
+        self.response_text = response_text
+        parts = [f"HTTP {status}"]
+        if code is not None:
+            parts.append(f"code={code}")
+        if msg:
+            parts.append(f"msg={msg}")
+        if url:
+            parts.append(f"url={url}")
+        super().__init__(" | ".join(parts))
+
+
 class BinanceFuturesClient:
     def __init__(
         self,
@@ -70,7 +94,21 @@ class BinanceFuturesClient:
             headers=headers,
             timeout=self.timeout,
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            data: Optional[Dict[str, Any]] = None
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    data = parsed
+            except ValueError:
+                data = None
+            code = data.get("code") if data else None
+            msg = data.get("msg") if data else None
+            raise BinanceAPIError(
+                resp.status_code, code=code, msg=msg, url=resp.url, response_text=resp.text
+            ) from exc
         return resp.json()
 
     def get_price(self, symbol: str) -> float:

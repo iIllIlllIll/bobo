@@ -25,7 +25,7 @@ from discord.ext import commands
 from discord.ui import View, Select, Button, Modal, TextInput
 from zoneinfo import ZoneInfo
 
-from backtest.binance import BinanceFuturesClient, BinanceSpotClient
+from backtest.binance import BinanceAPIError, BinanceFuturesClient, BinanceSpotClient
 from backtest.config import Settings, save_settings, load_settings
 from backtest.analysis import EntryDiffConfig
 from backtest.runner import (
@@ -4491,16 +4491,40 @@ class BacktestBot(commands.Bot):
             return None
         binance = BinanceFuturesClient(api_key, api_secret)
         if group == "live" and auto_trade:
+            def _is_noop_position_mode(exc: Exception) -> bool:
+                code, msg, body = self._extract_binance_error(exc)
+                if code in {-4059}:
+                    return True
+                text = " ".join(
+                    part for part in [msg or "", body or "", str(exc)] if part
+                ).lower()
+                return "no need to change position side" in text
+
+            def _is_noop_margin_type(exc: Exception) -> bool:
+                code, msg, body = self._extract_binance_error(exc)
+                if code in {-4046}:
+                    return True
+                text = " ".join(
+                    part for part in [msg or "", body or "", str(exc)] if part
+                ).lower()
+                return "no need to change margin type" in text or "already" in text
+
             try:
                 binance.set_position_mode(True)
             except Exception as exc:
-                logger.warning("Live hedge mode setup failed: %s", exc)
+                if not _is_noop_position_mode(exc):
+                    logger.warning(
+                        "Live hedge mode setup failed: %s",
+                        self._format_binance_error(exc),
+                    )
             try:
                 binance.set_margin_type(symbol, "ISOLATED")
             except Exception as exc:
-                text = str(exc).lower()
-                if "no need to change margin type" not in text and "already" not in text:
-                    logger.warning("Live margin type setup failed: %s", exc)
+                if not _is_noop_margin_type(exc):
+                    logger.warning(
+                        "Live margin type setup failed: %s",
+                        self._format_binance_error(exc),
+                    )
             if leverage:
                 try:
                     binance.set_leverage(symbol, int(leverage))
@@ -5447,23 +5471,102 @@ class BacktestBot(commands.Bot):
             return price * (1.0 - offset)
         return price * (1.0 + offset)
 
+    @staticmethod
+    def _extract_binance_error(
+        exc: Exception,
+    ) -> tuple[Optional[int], Optional[str], Optional[str]]:
+        code = None
+        msg = None
+        body = None
+        if isinstance(exc, BinanceAPIError):
+            return exc.code, exc.msg, exc.response_text
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return code, msg, body
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                msg = payload.get("msg")
+        except Exception:
+            pass
+        try:
+            body = resp.text
+        except Exception:
+            body = None
+        return code, msg, body
+
+    @classmethod
+    def _format_binance_error(cls, exc: Exception) -> str:
+        code, msg, body = cls._extract_binance_error(exc)
+        parts: List[str] = []
+        if code is not None:
+            parts.append(f"code={code}")
+        if msg:
+            parts.append(f"msg={msg}")
+        if body and (not msg or body.strip() != msg.strip()):
+            parts.append(f"body={body}")
+        if parts:
+            return ", ".join(parts)
+        return str(exc)
+
     async def _ensure_hedge_and_isolated(
         self,
         client: BinanceFuturesClient,
         symbol: str,
-    ) -> List[str]:
+    ) -> Tuple[List[str], bool, bool]:
+        def _is_noop_position_mode(exc: Exception) -> bool:
+            code, msg, body = self._extract_binance_error(exc)
+            if code in {-4059}:
+                return True
+            text = " ".join(
+                part for part in [msg or "", body or "", str(exc)] if part
+            ).lower()
+            if "no need to change position side" in text:
+                return True
+            if "position side" in text and "no need to change" in text:
+                return True
+            return False
+
+        def _is_noop_margin_type(exc: Exception) -> bool:
+            code, msg, body = self._extract_binance_error(exc)
+            if code in {-4046}:
+                return True
+            text = " ".join(
+                part for part in [msg or "", body or "", str(exc)] if part
+            ).lower()
+            if "no need to change margin type" in text:
+                return True
+            if "margin type" in text and "already" in text:
+                return True
+            if "no need to change margin type" in text or "already" in text:
+                return True
+            return False
+
         notes: List[str] = []
+        hedge_ok = False
         try:
             await asyncio.to_thread(client.set_position_mode, True)
+            hedge_ok = True
         except Exception as exc:
-            notes.append(f"Failed to set hedge mode: {exc}")
+            if _is_noop_position_mode(exc):
+                hedge_ok = True
+            else:
+                notes.append(
+                    f"Failed to set hedge mode: {self._format_binance_error(exc)}"
+                )
+        isolated_ok = False
         try:
             await asyncio.to_thread(client.set_margin_type, symbol, "ISOLATED")
+            isolated_ok = True
         except Exception as exc:
-            text = str(exc).lower()
-            if "no need to change margin type" not in text and "already" not in text:
-                notes.append(f"Failed to set isolated margin: {exc}")
-        return notes
+            if _is_noop_margin_type(exc):
+                isolated_ok = True
+            else:
+                notes.append(
+                    f"Failed to set isolated margin: {self._format_binance_error(exc)}"
+                )
+        return notes, hedge_ok, isolated_ok
 
     async def _place_limit_maker_with_retry(
         self,
@@ -5540,7 +5643,7 @@ class BacktestBot(commands.Bot):
                     "filled": False,
                     "remaining_qty": remaining_qty,
                     "order_id": last_order_id,
-                    "note": f"Order failed: {exc}",
+                    "note": f"Order failed: {self._format_binance_error(exc)}",
                 }
 
             order_id = order.get("orderId") if isinstance(order, dict) else None
@@ -5569,7 +5672,7 @@ class BacktestBot(commands.Bot):
                     "filled": False,
                     "remaining_qty": remaining_qty,
                     "order_id": order_id,
-                    "note": f"Order status failed: {exc}",
+                    "note": f"Order status failed: {self._format_binance_error(exc)}",
                 }
 
             if status == "FILLED":
@@ -5618,13 +5721,21 @@ class BacktestBot(commands.Bot):
         retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
-        notes = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        if not hedge_ok:
+            extra = f"\nNote: {' | '.join(notes)}" if notes else ""
+            await _send(
+                "Live order blocked: hedge mode is not enabled on the account."
+                f"{extra}",
+                ephemeral=True,
+            )
+            return
 
         leverage_note = ""
         try:
             await asyncio.to_thread(client.set_leverage, draft.symbol, int(draft.leverage))
         except Exception as exc:
-            leverage_note = f"Leverage set failed: {exc}"
+            leverage_note = f"Leverage set failed: {self._format_binance_error(exc)}"
 
         result = await self._place_limit_maker_with_retry(
             client=client,
@@ -5684,7 +5795,15 @@ class BacktestBot(commands.Bot):
         retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
-        notes = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        if not hedge_ok:
+            extra = f"\nNote: {' | '.join(notes)}" if notes else ""
+            await _send(
+                "Close blocked: hedge mode is not enabled on the account."
+                f"{extra}",
+                ephemeral=True,
+            )
+            return
 
         result = await self._place_limit_maker_with_retry(
             client=client,
