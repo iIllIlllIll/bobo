@@ -195,7 +195,9 @@ class BinanceFuturesClient:
         params = {
             "symbol": symbol.upper(),
             "side": side.upper(),
-            "type": "LIMIT_MAKER",
+            # Futures does not accept LIMIT_MAKER; use LIMIT + GTX (post-only).
+            "type": "LIMIT",
+            "timeInForce": "GTX",
             "quantity": qty,
             "price": price,
             "reduceOnly": "true" if reduce_only else "false",
