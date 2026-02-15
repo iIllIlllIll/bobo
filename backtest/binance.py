@@ -96,6 +96,22 @@ class BinanceFuturesClient:
             signed=True,
         )
 
+    def set_margin_type(self, symbol: str, margin_type: str) -> Any:
+        return self._request(
+            "POST",
+            "/fapi/v1/marginType",
+            params={"symbol": symbol.upper(), "marginType": margin_type.upper()},
+            signed=True,
+        )
+
+    def set_position_mode(self, dual_side: bool) -> Any:
+        return self._request(
+            "POST",
+            "/fapi/v1/positionSide/dual",
+            params={"dualSidePosition": "true" if dual_side else "false"},
+            signed=True,
+        )
+
     def get_account(self) -> Any:
         return self._request("GET", "/fapi/v2/account", signed=True)
 
@@ -136,6 +152,7 @@ class BinanceFuturesClient:
         qty: float,
         price: float,
         reduce_only: bool = False,
+        position_side: Optional[str] = None,
     ) -> Any:
         params = {
             "symbol": symbol.upper(),
@@ -145,6 +162,8 @@ class BinanceFuturesClient:
             "price": price,
             "reduceOnly": "true" if reduce_only else "false",
         }
+        if position_side:
+            params["positionSide"] = position_side.upper()
         return self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
     def get_order(
@@ -176,3 +195,74 @@ class BinanceFuturesClient:
         if orig_client_order_id:
             params["origClientOrderId"] = orig_client_order_id
         return self._request("DELETE", "/fapi/v1/order", params=params, signed=True)
+
+
+class BinanceSpotClient:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        base_url: str = "https://api.binance.com",
+        recv_window: int = 5000,
+        timeout: int = 10,
+    ) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url.rstrip("/")
+        self.recv_window = recv_window
+        self.timeout = timeout
+
+    def _sign(self, params: list[tuple[str, Any]] | Dict[str, Any]) -> str:
+        if isinstance(params, dict):
+            query = urlencode(params, doseq=True)
+        else:
+            query = urlencode(params, doseq=True)
+        return hmac.new(
+            self.api_secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        signed: bool = False,
+    ) -> Any:
+        base_params = dict(params or {})
+        headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
+        request_params: Dict[str, Any] | list[tuple[str, Any]]
+        if signed:
+            param_items = list(base_params.items())
+            param_items.append(("timestamp", int(time.time() * 1000)))
+            param_items.append(("recvWindow", self.recv_window))
+            signature = self._sign(param_items)
+            param_items.append(("signature", signature))
+            request_params = param_items
+        else:
+            request_params = base_params
+        url = f"{self.base_url}{path}"
+        resp = requests.request(
+            method,
+            url,
+            params=request_params,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_account(self) -> Any:
+        return self._request("GET", "/api/v3/account", signed=True)
+
+    def get_price(self, symbol: str) -> float:
+        data = self._request(
+            "GET",
+            "/api/v3/ticker/price",
+            params={"symbol": symbol.upper()},
+        )
+        return float(data["price"])
+
+    def get_prices(self) -> Any:
+        return self._request("GET", "/api/v3/ticker/price")

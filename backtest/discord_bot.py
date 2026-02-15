@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Any, Dict, List, Sequence, Tuple, Callable
+from typing import Optional, Any, Dict, List, Sequence, Tuple, Callable, Union
 
 import discord
 import numpy as np
@@ -25,7 +25,7 @@ from discord.ext import commands
 from discord.ui import View, Select, Button, Modal, TextInput
 from zoneinfo import ZoneInfo
 
-from backtest.binance import BinanceFuturesClient
+from backtest.binance import BinanceFuturesClient, BinanceSpotClient
 from backtest.config import Settings, save_settings, load_settings
 from backtest.analysis import EntryDiffConfig
 from backtest.runner import (
@@ -120,6 +120,29 @@ class WordleGame:
     @property
     def attempts_left(self) -> int:
         return max(self.max_attempts - len(self.guesses), 0)
+
+
+@dataclass
+class LiveOrderDraft:
+    symbol: str
+    side: str
+    position_side: str
+    leverage: float
+    usdt_amount: float
+    price: float
+    qty: float
+    reduce_only: bool
+    maker_offset_bps: float
+
+
+@dataclass
+class ClosePositionDraft:
+    symbol: str
+    side: str
+    position_side: str
+    qty: float
+    price: float
+    maker_offset_bps: float
 
 
 WORDLE_WORDS = (
@@ -354,6 +377,112 @@ class SettingOverwriteSelect(Select):
         )
 
 
+class SettingApplySelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.requester_id = requester_id
+        options: List[discord.SelectOption] = []
+        for name in profiles:
+            label = bot._format_setting_profile_label(name)
+            options.append(discord.SelectOption(label=label[:100], value=name))
+        super().__init__(
+            placeholder="Select a profile to apply",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        name = self.values[0]
+        ok, message = await self.bot._apply_setting_profile(name)
+        await interaction.response.send_message(
+            message,
+            ephemeral=not ok,
+        )
+
+
+class LiveOrderModal(Modal):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        default_symbol: str,
+        default_leverage: float,
+    ) -> None:
+        super().__init__(title="Place Live Futures Order")
+        self.bot = bot
+        self.requester_id = requester_id
+        self.default_symbol = default_symbol
+        self.default_leverage = default_leverage
+        self.side = TextInput(
+            label="Side",
+            placeholder="long / short (or buy / sell)",
+            required=True,
+            max_length=10,
+        )
+        self.usdt_amount = TextInput(
+            label="Amount (USDT)",
+            placeholder="e.g. 10",
+            required=True,
+            max_length=20,
+        )
+        self.price = TextInput(
+            label="Price (optional)",
+            placeholder="Leave blank to use current price",
+            required=False,
+            max_length=20,
+        )
+        self.symbol = TextInput(
+            label=f"Symbol (default {default_symbol})",
+            placeholder=default_symbol,
+            required=False,
+            max_length=20,
+        )
+        self.leverage = TextInput(
+            label=f"Leverage (default {default_leverage})",
+            placeholder=str(default_leverage),
+            required=False,
+            max_length=10,
+        )
+        for item in (
+            self.side,
+            self.usdt_amount,
+            self.price,
+            self.symbol,
+            self.leverage,
+        ):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can submit this order.",
+                ephemeral=True,
+            )
+            return
+        args = " ".join(
+            [
+                self.side.value.strip(),
+                self.usdt_amount.value.strip(),
+                self.price.value.strip(),
+                self.symbol.value.strip(),
+                self.leverage.value.strip(),
+            ]
+        ).strip()
+        await self.bot._handle_live_order(interaction, args)
+
+
 class SettingOverwriteView(View):
     def __init__(
         self,
@@ -373,6 +502,280 @@ class SettingOverwriteView(View):
         if self.message:
             await self.message.edit(view=self)
 
+
+class SettingApplyView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.add_item(SettingApplySelect(bot, profiles, requester_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class LiveOrderStartView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        default_symbol: str,
+        default_leverage: float,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.default_symbol = default_symbol
+        self.default_leverage = default_leverage
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Open Order Form", style=discord.ButtonStyle.primary)
+    async def open_form(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can open this form.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            LiveOrderModal(
+                self.bot,
+                self.requester_id,
+                self.default_symbol,
+                self.default_leverage,
+            )
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can cancel this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class LiveOrderConfirmView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        draft: LiveOrderDraft,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.draft = draft
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Place Order", style=discord.ButtonStyle.primary)
+    async def place_order(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can place this order.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+        await self.bot._execute_live_order(interaction, self.draft)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can cancel this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class ClosePositionSelect(discord.ui.Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        drafts: List[ClosePositionDraft],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.drafts = drafts
+        self.requester_id = requester_id
+        options: List[discord.SelectOption] = []
+        for idx, draft in enumerate(drafts):
+            label = f"{draft.symbol} {draft.position_side}"
+            desc = f"qty {draft.qty:.6g} @ {bot._fmt_price(draft.price)}"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(idx),
+                    description=desc[:100],
+                )
+            )
+        super().__init__(
+            placeholder="Select a position to close",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can close a position.",
+                ephemeral=True,
+            )
+            return
+        idx = int(self.values[0])
+        draft = self.drafts[idx]
+        view = ClosePositionConfirmView(self.bot, self.requester_id, draft)
+        text = (
+            "Confirm close:\n"
+            f"- Symbol: {draft.symbol}\n"
+            f"- Side: {draft.position_side}\n"
+            f"- Qty: {draft.qty:.6g}\n"
+            f"- Price: {self.bot._fmt_price(draft.price)} (maker)"
+        )
+        if interaction.response.is_done():
+            message = await interaction.followup.send(text, view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, view=view, ephemeral=True)
+            message = await interaction.original_response()
+        view.message = message
+
+
+class ClosePositionSelectView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        drafts: List[ClosePositionDraft],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.add_item(ClosePositionSelect(bot, drafts, requester_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class ClosePositionConfirmView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        draft: ClosePositionDraft,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.draft = draft
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Close Position", style=discord.ButtonStyle.danger)
+    async def close(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can close this position.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+        await self.bot._execute_close_position(interaction, self.draft)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can cancel this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
 
 class SettingSaveChoiceView(View):
     def __init__(self, bot: "BacktestBot", requester_id: int) -> None:
@@ -3187,6 +3590,10 @@ class BacktestBot(commands.Bot):
             commands.Command(setting_text_command, name="setting"),
             commands.Command(sim_text_command, name="sim"),
             commands.Command(live_text_command, name="live"),
+            commands.Command(order_text_command, name="order"),
+            commands.Command(close_text_command, name="close"),
+            commands.Command(positions_text_command, name="positions"),
+            commands.Command(assets_text_command, name="assets"),
             commands.Command(wordle_text_command, name="wordle"),
             commands.Command(help_text_command, name="help"),
         ]
@@ -4083,11 +4490,22 @@ class BacktestBot(commands.Bot):
             logger.warning("Live runner missing api_key/api_secret; skipping live start.")
             return None
         binance = BinanceFuturesClient(api_key, api_secret)
-        if group == "live" and auto_trade and leverage:
+        if group == "live" and auto_trade:
             try:
-                binance.set_leverage(symbol, int(leverage))
-            except Exception:
-                pass
+                binance.set_position_mode(True)
+            except Exception as exc:
+                logger.warning("Live hedge mode setup failed: %s", exc)
+            try:
+                binance.set_margin_type(symbol, "ISOLATED")
+            except Exception as exc:
+                text = str(exc).lower()
+                if "no need to change margin type" not in text and "already" not in text:
+                    logger.warning("Live margin type setup failed: %s", exc)
+            if leverage:
+                try:
+                    binance.set_leverage(symbol, int(leverage))
+                except Exception:
+                    pass
 
         strategy_name = "cheatkey"
         strategy_params = {}
@@ -4959,6 +5377,347 @@ class BacktestBot(commands.Bot):
         else:
             self.live_cfg = cfg
         return cfg
+
+    def _get_live_client(self) -> tuple[Optional[BinanceFuturesClient], Optional[str]]:
+        cfg = self._get_realtime_cfg("live")
+        api_key = str(cfg.get("api_key", "") or "")
+        api_secret = str(cfg.get("api_secret", "") or "")
+        if not api_key or not api_secret:
+            return None, "Live API key/secret not configured. Use `!live api` first."
+        runner = self.live_runner
+        if runner and runner.binance:
+            return runner.binance, None
+        return BinanceFuturesClient(api_key, api_secret), None
+
+    def _get_spot_client(self) -> tuple[Optional[BinanceSpotClient], Optional[str]]:
+        cfg = self._get_realtime_cfg("live")
+        api_key = str(cfg.get("api_key", "") or "")
+        api_secret = str(cfg.get("api_secret", "") or "")
+        if not api_key or not api_secret:
+            return None, "Live API key/secret not configured. Use `!live api` first."
+        return BinanceSpotClient(api_key, api_secret), None
+
+    async def _fetch_live_account_snapshot(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+    ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+        available = None
+        wallet = None
+        notes: List[str] = []
+        try:
+            account = await asyncio.to_thread(client.get_account)
+            if isinstance(account, dict):
+                assets = account.get("assets") or []
+                for asset in assets:
+                    if str(asset.get("asset", "")).upper() == "USDT":
+                        try:
+                            available = float(asset.get("availableBalance", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            available = None
+                        try:
+                            wallet = float(asset.get("walletBalance", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            wallet = None
+                        break
+        except Exception as exc:
+            notes.append(f"Balance fetch failed: {exc}")
+
+        price = None
+        payload = self._realtime_payloads.get("live")
+        if payload and payload.symbol == symbol and payload.price:
+            price = float(payload.price)
+        else:
+            try:
+                price = float(await asyncio.to_thread(client.get_price, symbol))
+            except Exception as exc:
+                notes.append(f"Price fetch failed: {exc}")
+
+        note = "\n".join(notes) if notes else None
+        return available, wallet, price, note
+
+    @staticmethod
+    def _apply_maker_offset(price: float, side: str, maker_offset_bps: float) -> float:
+        if price <= 0:
+            return price
+        offset = float(maker_offset_bps or 0.0) / 10000.0
+        if offset <= 0:
+            return price
+        if side.upper() == "BUY":
+            return price * (1.0 - offset)
+        return price * (1.0 + offset)
+
+    async def _ensure_hedge_and_isolated(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+    ) -> List[str]:
+        notes: List[str] = []
+        try:
+            await asyncio.to_thread(client.set_position_mode, True)
+        except Exception as exc:
+            notes.append(f"Failed to set hedge mode: {exc}")
+        try:
+            await asyncio.to_thread(client.set_margin_type, symbol, "ISOLATED")
+        except Exception as exc:
+            text = str(exc).lower()
+            if "no need to change margin type" not in text and "already" not in text:
+                notes.append(f"Failed to set isolated margin: {exc}")
+        return notes
+
+    async def _place_limit_maker_with_retry(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+        side: str,
+        qty: float,
+        base_price: float,
+        reduce_only: bool,
+        position_side: str,
+        maker_offset_bps: float,
+        retry_seconds: float,
+        max_attempts: int,
+    ) -> Dict[str, Any]:
+        tick_size = 0.0
+        step_size = 0.0
+        try:
+            filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
+            tick_size = filters.tick_size
+            step_size = filters.step_size
+        except Exception:
+            pass
+
+        remaining_qty = RealtimeRunner._round_step(qty, step_size)
+        if remaining_qty <= 0:
+            return {
+                "filled": False,
+                "remaining_qty": remaining_qty,
+                "order_id": None,
+                "note": "Quantity too small after rounding.",
+            }
+
+        attempt = 0
+        last_order_id: Optional[int] = None
+        while remaining_qty > 0:
+            attempt += 1
+            if max_attempts > 0 and attempt > max_attempts:
+                break
+
+            target_price = base_price
+            if attempt > 1:
+                try:
+                    target_price = float(
+                        await asyncio.to_thread(client.get_price, symbol)
+                    )
+                except Exception:
+                    target_price = base_price
+            adjusted_price = self._apply_maker_offset(
+                float(target_price), side, maker_offset_bps
+            )
+            adjusted_price = RealtimeRunner._round_price(
+                adjusted_price, tick_size, side
+            )
+            if adjusted_price <= 0:
+                return {
+                    "filled": False,
+                    "remaining_qty": remaining_qty,
+                    "order_id": last_order_id,
+                    "note": "Price invalid after rounding.",
+                }
+
+            try:
+                order = await asyncio.to_thread(
+                    client.place_limit_maker,
+                    symbol,
+                    side,
+                    remaining_qty,
+                    adjusted_price,
+                    reduce_only,
+                    position_side,
+                )
+            except Exception as exc:
+                return {
+                    "filled": False,
+                    "remaining_qty": remaining_qty,
+                    "order_id": last_order_id,
+                    "note": f"Order failed: {exc}",
+                }
+
+            order_id = order.get("orderId") if isinstance(order, dict) else None
+            last_order_id = order_id
+            if retry_seconds <= 0 or order_id is None:
+                return {
+                    "filled": True,
+                    "remaining_qty": remaining_qty,
+                    "order_id": order_id,
+                    "note": "Order placed (status unknown; retry disabled).",
+                }
+
+            await asyncio.sleep(retry_seconds)
+
+            status = ""
+            executed_qty = 0.0
+            try:
+                order_status = await asyncio.to_thread(
+                    client.get_order, symbol, order_id
+                )
+                if isinstance(order_status, dict):
+                    status = str(order_status.get("status", "")).upper()
+                    executed_qty = float(order_status.get("executedQty", 0.0) or 0.0)
+            except Exception as exc:
+                return {
+                    "filled": False,
+                    "remaining_qty": remaining_qty,
+                    "order_id": order_id,
+                    "note": f"Order status failed: {exc}",
+                }
+
+            if status == "FILLED":
+                return {
+                    "filled": True,
+                    "remaining_qty": 0.0,
+                    "order_id": order_id,
+                    "note": None,
+                }
+
+            try:
+                await asyncio.to_thread(client.cancel_order, symbol, order_id)
+            except Exception:
+                pass
+
+            remaining_qty = max(remaining_qty - executed_qty, 0.0)
+            remaining_qty = RealtimeRunner._round_step(remaining_qty, step_size)
+
+        return {
+            "filled": False,
+            "remaining_qty": remaining_qty,
+            "order_id": last_order_id,
+            "note": "Order not fully filled after retries.",
+        }
+
+    async def _execute_live_order(
+        self,
+        target: Union[discord.Interaction, commands.Context],
+        draft: LiveOrderDraft,
+    ) -> None:
+        async def _send(message: str, *, ephemeral: bool = False) -> None:
+            if isinstance(target, discord.Interaction):
+                if target.response.is_done():
+                    await target.followup.send(message, ephemeral=ephemeral)
+                else:
+                    await target.response.send_message(message, ephemeral=ephemeral)
+            else:
+                await target.reply(message)
+
+        client, err = self._get_live_client()
+        if err:
+            await _send(err, ephemeral=True)
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
+        max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
+
+        notes = await self._ensure_hedge_and_isolated(client, draft.symbol)
+
+        leverage_note = ""
+        try:
+            await asyncio.to_thread(client.set_leverage, draft.symbol, int(draft.leverage))
+        except Exception as exc:
+            leverage_note = f"Leverage set failed: {exc}"
+
+        result = await self._place_limit_maker_with_retry(
+            client=client,
+            symbol=draft.symbol,
+            side=draft.side,
+            qty=draft.qty,
+            base_price=draft.price,
+            reduce_only=draft.reduce_only,
+            position_side=draft.position_side,
+            maker_offset_bps=draft.maker_offset_bps,
+            retry_seconds=retry_seconds,
+            max_attempts=max_attempts,
+        )
+
+        status = "filled" if result.get("filled") else "pending/partial"
+        order_id = result.get("order_id")
+        note = result.get("note")
+        extra_notes = [n for n in notes if n]
+        if leverage_note:
+            extra_notes.append(leverage_note)
+        if note:
+            extra_notes.append(note)
+        extras = f"\nNote: {' | '.join(extra_notes)}" if extra_notes else ""
+
+        suffix = f" order_id={order_id}" if order_id else ""
+        remaining_qty = float(result.get("remaining_qty", 0.0) or 0.0)
+        remaining_text = (
+            f"\nRemaining qty: {remaining_qty:.6g}" if remaining_qty > 0 else ""
+        )
+        await _send(
+            f"Live order {status}: {draft.position_side} {draft.qty:.6g} {draft.symbol} "
+            f"@ {self._fmt_price(draft.price)} (lev {draft.leverage:.2f}x){suffix}"
+            f"{remaining_text}{extras}",
+            ephemeral=isinstance(target, discord.Interaction),
+        )
+
+    async def _execute_close_position(
+        self,
+        target: Union[discord.Interaction, commands.Context],
+        draft: ClosePositionDraft,
+    ) -> None:
+        async def _send(message: str, *, ephemeral: bool = False) -> None:
+            if isinstance(target, discord.Interaction):
+                if target.response.is_done():
+                    await target.followup.send(message, ephemeral=ephemeral)
+                else:
+                    await target.response.send_message(message, ephemeral=ephemeral)
+            else:
+                await target.reply(message)
+
+        client, err = self._get_live_client()
+        if err:
+            await _send(err, ephemeral=True)
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
+        max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
+
+        notes = await self._ensure_hedge_and_isolated(client, draft.symbol)
+
+        result = await self._place_limit_maker_with_retry(
+            client=client,
+            symbol=draft.symbol,
+            side=draft.side,
+            qty=draft.qty,
+            base_price=draft.price,
+            reduce_only=True,
+            position_side=draft.position_side,
+            maker_offset_bps=draft.maker_offset_bps,
+            retry_seconds=retry_seconds,
+            max_attempts=max_attempts,
+        )
+
+        status = "filled" if result.get("filled") else "pending/partial"
+        order_id = result.get("order_id")
+        note = result.get("note")
+        extra_notes = [n for n in notes if n]
+        if note:
+            extra_notes.append(note)
+        extras = f"\nNote: {' | '.join(extra_notes)}" if extra_notes else ""
+
+        suffix = f" order_id={order_id}" if order_id else ""
+        remaining_qty = float(result.get("remaining_qty", 0.0) or 0.0)
+        remaining_text = (
+            f"\nRemaining qty: {remaining_qty:.6g}" if remaining_qty > 0 else ""
+        )
+        await _send(
+            f"Close order {status}: {draft.position_side} {draft.qty:.6g} {draft.symbol} "
+            f"@ {self._fmt_price(draft.price)}{suffix}{remaining_text}{extras}",
+            ephemeral=isinstance(target, discord.Interaction),
+        )
+
 
     def _sim_initial_balance(self) -> float:
         cfg = self._get_realtime_cfg("sim")
@@ -8898,6 +9657,632 @@ class BacktestBot(commands.Bot):
     async def live_text(self, ctx: commands.Context, *, args: str = "") -> None:
         await self._realtime_text_command(ctx, group="live", args=args)
 
+    async def order_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live orders"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!order` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can place live orders.")
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        default_symbol = str(cfg.get("symbol", "XRPUSDT")).upper()
+        try:
+            default_leverage = float(
+                cfg.get("leverage", self.settings.backtest.get("leverage", 1.0))
+            )
+        except (TypeError, ValueError):
+            default_leverage = 1.0
+
+        if not args.strip():
+            usage = (
+                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`\n"
+                f"Defaults: symbol={default_symbol}, leverage={default_leverage}\n"
+                "Examples:\n"
+                f"- `!order long 10` (uses current {default_symbol} price)\n"
+                f"- `!order short 25 0.63 {default_symbol} 5`"
+            )
+            account_note = ""
+            client, err = self._get_live_client()
+            if err:
+                account_note = f"\n{err}"
+            else:
+                available, wallet, price, note = await self._fetch_live_account_snapshot(
+                    client, default_symbol
+                )
+                if note:
+                    account_note = f"\n{note}"
+                else:
+                    available_text = (
+                        f"{available:,.2f}" if available is not None else "n/a"
+                    )
+                    wallet_text = f"{wallet:,.2f}" if wallet is not None else "n/a"
+                    price_text = self._fmt_price(price)
+                    account_note = (
+                        f"\nAvailable USDT: {available_text} (wallet {wallet_text})"
+                        f"\nCurrent {default_symbol}: {price_text}"
+                    )
+            view = LiveOrderStartView(
+                self, ctx.author.id, default_symbol, default_leverage
+            )
+            message = await ctx.reply(f"{usage}{account_note}", view=view)
+            view.message = message
+            return
+
+        await self._handle_live_order(ctx, args)
+
+    async def close_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live orders"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!close` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can close positions.")
+            return
+        if args.strip():
+            await ctx.reply("Usage: `!close`")
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        try:
+            positions = await asyncio.to_thread(client.get_position_risk)
+        except Exception as exc:
+            await ctx.reply(f"Failed to fetch positions: {exc}")
+            return
+
+        if not isinstance(positions, list):
+            await ctx.reply("No position data returned.")
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        maker_offset_bps = float(cfg.get("maker_offset_bps", 1.0) or 0.0)
+        drafts: List[ClosePositionDraft] = []
+        lines: List[str] = []
+
+        for item in positions:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "") or "").upper()
+            if not symbol:
+                continue
+            position_amt = float(item.get("positionAmt", 0.0) or 0.0)
+            if position_amt == 0:
+                continue
+            position_side = str(item.get("positionSide", "BOTH") or "BOTH").upper()
+            if position_side not in {"LONG", "SHORT"}:
+                position_side = "LONG" if position_amt > 0 else "SHORT"
+            qty = abs(position_amt)
+            if qty <= 0:
+                continue
+            side = "SELL" if position_side == "LONG" else "BUY"
+
+            price = None
+            payload = self._realtime_payloads.get("live")
+            if payload and payload.symbol == symbol and payload.price:
+                price = float(payload.price)
+            else:
+                try:
+                    price = float(await asyncio.to_thread(client.get_price, symbol))
+                except Exception:
+                    price = 0.0
+            if price <= 0:
+                continue
+            order_price = self._apply_maker_offset(price, side, maker_offset_bps)
+            draft = ClosePositionDraft(
+                symbol=symbol,
+                side=side,
+                position_side=position_side,
+                qty=qty,
+                price=order_price,
+                maker_offset_bps=maker_offset_bps,
+            )
+            drafts.append(draft)
+            entry_price = item.get("entryPrice", "n/a")
+            lines.append(
+                f"- {symbol} {position_side} qty {qty:.6g} entry {self._fmt_price(entry_price)}"
+            )
+
+        if not drafts:
+            await ctx.reply("No open positions to close.")
+            return
+
+        view = ClosePositionSelectView(self, drafts, ctx.author.id)
+        message = await ctx.reply(
+            "Open positions:\n" + "\n".join(lines),
+            view=view,
+        )
+        view.message = message
+
+    async def positions_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live positions"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!positions` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can view live positions.")
+            return
+        if args.strip():
+            await ctx.reply("Usage: `!positions`")
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        try:
+            positions = await asyncio.to_thread(client.get_position_risk)
+        except Exception as exc:
+            await ctx.reply(f"Failed to fetch positions: {exc}")
+            return
+
+        if not isinstance(positions, list):
+            await ctx.reply("No position data returned.")
+            return
+
+        def fmt_money(value: Any) -> str:
+            try:
+                return f"{float(value):,.2f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        lines: List[str] = []
+        total_unreal = 0.0
+        count = 0
+        for item in positions:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "") or "").upper()
+            if not symbol:
+                continue
+            position_amt = float(item.get("positionAmt", 0.0) or 0.0)
+            if position_amt == 0:
+                continue
+            position_side = str(item.get("positionSide", "BOTH") or "BOTH").upper()
+            if position_side not in {"LONG", "SHORT"}:
+                position_side = "LONG" if position_amt > 0 else "SHORT"
+            qty = abs(position_amt)
+            entry_price = item.get("entryPrice", "n/a")
+            mark_price = item.get("markPrice", "n/a")
+            leverage = item.get("leverage", "n/a")
+            liq_price = item.get("liquidationPrice", "n/a")
+            unreal = float(item.get("unRealizedProfit", 0.0) or 0.0)
+            total_unreal += unreal
+            count += 1
+            line = (
+                f"{symbol} {position_side} | qty {qty:.6g} | entry {self._fmt_price(entry_price)} "
+                f"| mark {self._fmt_price(mark_price)} | pnl {unreal:+,.2f} | lev {leverage}x "
+                f"| liq {self._fmt_price(liq_price)}"
+            )
+            lines.append(line)
+
+        if not lines:
+            await ctx.reply("No open positions.")
+            return
+
+        embed = discord.Embed(
+            title="📌 Live Open Positions",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="Summary",
+            value=f"Positions: {count}\nUnrealized PnL: {fmt_money(total_unreal)}",
+            inline=False,
+        )
+
+        chunk: List[str] = []
+        chunk_len = 0
+        for line in lines:
+            add_len = len(line) + (1 if chunk else 0)
+            if chunk_len + add_len > 950:
+                embed.add_field(
+                    name="Positions",
+                    value="\n".join(chunk),
+                    inline=False,
+                )
+                chunk = []
+                chunk_len = 0
+            chunk.append(line)
+            chunk_len += add_len
+        if chunk:
+            embed.add_field(
+                name="Positions",
+                value="\n".join(chunk),
+                inline=False,
+            )
+
+        embed.set_footer(text=datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST"))
+        await ctx.reply(embed=embed)
+
+    async def assets_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live assets"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!assets` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can view live assets.")
+            return
+        if args.strip():
+            await ctx.reply("Usage: `!assets`")
+            return
+
+        futures_client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        spot_client, spot_err = self._get_spot_client()
+        if spot_err:
+            await ctx.reply(spot_err)
+            return
+
+        futures_account = None
+        spot_account = None
+        prices = None
+
+        try:
+            futures_account = await asyncio.to_thread(futures_client.get_account)
+        except Exception as exc:
+            await ctx.reply(f"Failed to fetch futures account: {exc}")
+            return
+
+        try:
+            spot_account = await asyncio.to_thread(spot_client.get_account)
+        except Exception as exc:
+            await ctx.reply(f"Failed to fetch spot account: {exc}")
+            return
+
+        try:
+            prices = await asyncio.to_thread(spot_client.get_prices)
+        except Exception:
+            prices = None
+
+        price_map: Dict[str, float] = {}
+        if isinstance(prices, list):
+            for item in prices:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol", "") or "").upper()
+                if not symbol:
+                    continue
+                try:
+                    price_map[symbol] = float(item.get("price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+
+        def fmt_money(value: Any) -> str:
+            try:
+                return f"{float(value):,.2f}"
+            except (TypeError, ValueError):
+                return "n/a"
+
+        futures_text = "n/a"
+        if isinstance(futures_account, dict):
+            total_wallet = futures_account.get("totalWalletBalance")
+            total_margin = futures_account.get("totalMarginBalance")
+            total_unreal = futures_account.get("totalUnrealizedProfit")
+            available = futures_account.get("availableBalance")
+            futures_text = (
+                f"Wallet: {fmt_money(total_wallet)} USDT\n"
+                f"Available: {fmt_money(available)} USDT\n"
+                f"Margin: {fmt_money(total_margin)} USDT\n"
+                f"Unrealized: {fmt_money(total_unreal)} USDT"
+            )
+
+        spot_lines: List[Tuple[float, str]] = []
+        spot_total = 0.0
+        total_assets = 0
+        balances = spot_account.get("balances") if isinstance(spot_account, dict) else None
+        if isinstance(balances, list):
+            for bal in balances:
+                if not isinstance(bal, dict):
+                    continue
+                asset = str(bal.get("asset", "") or "").upper()
+                try:
+                    free = float(bal.get("free", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    free = 0.0
+                try:
+                    locked = float(bal.get("locked", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    locked = 0.0
+                total = free + locked
+                if total <= 0:
+                    continue
+                total_assets += 1
+                est_usdt = None
+                if asset == "USDT":
+                    est_usdt = total
+                else:
+                    symbol = f"{asset}USDT"
+                    price = price_map.get(symbol)
+                    if price:
+                        est_usdt = total * price
+                est_text = fmt_money(est_usdt) if est_usdt is not None else "n/a"
+                if est_usdt is not None:
+                    spot_total += est_usdt
+                sort_value = est_usdt if est_usdt is not None else 0.0
+                spot_lines.append(
+                    (
+                        sort_value,
+                        f"{asset}: {total:.6g} (free {free:.6g}) | ≈ {est_text} USDT",
+                    )
+                )
+
+        if spot_lines:
+            spot_lines.sort(key=lambda item: item[0], reverse=True)
+            spot_display = [line for _, line in spot_lines]
+        else:
+            spot_display = ["No spot balances."]
+
+        embed = discord.Embed(
+            title="💼 Account Assets",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(name="Futures (USDT)", value=futures_text, inline=False)
+        embed.add_field(
+            name="Spot Summary",
+            value=f"Assets: {total_assets}\nEstimated USDT: {fmt_money(spot_total)}",
+            inline=False,
+        )
+
+        chunk: List[str] = []
+        chunk_len = 0
+        for line in spot_display:
+            add_len = len(line) + (1 if chunk else 0)
+            if chunk_len + add_len > 950:
+                embed.add_field(
+                    name="Spot Balances",
+                    value="\n".join(chunk),
+                    inline=False,
+                )
+                chunk = []
+                chunk_len = 0
+            chunk.append(line)
+            chunk_len += add_len
+        if chunk:
+            embed.add_field(
+                name="Spot Balances",
+                value="\n".join(chunk),
+                inline=False,
+            )
+
+        embed.set_footer(text=datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S KST"))
+        await ctx.reply(embed=embed)
+
+    async def _handle_live_order(
+        self,
+        target: Union[discord.Interaction, commands.Context],
+        args: str,
+    ) -> None:
+        async def _send(message: str, *, ephemeral: bool = False) -> None:
+            if isinstance(target, discord.Interaction):
+                if target.response.is_done():
+                    await target.followup.send(message, ephemeral=ephemeral)
+                else:
+                    await target.response.send_message(message, ephemeral=ephemeral)
+            else:
+                await target.reply(message)
+
+        async def _send_with_view(
+            message: str,
+            view: View,
+            *,
+            ephemeral: bool = False,
+        ) -> None:
+            if isinstance(target, discord.Interaction):
+                if target.response.is_done():
+                    msg = await target.followup.send(
+                        message, view=view, ephemeral=ephemeral
+                    )
+                else:
+                    await target.response.send_message(
+                        message, view=view, ephemeral=ephemeral
+                    )
+                    msg = await target.original_response()
+            else:
+                msg = await target.reply(message, view=view)
+            view.message = msg
+
+        cfg = self._get_realtime_cfg("live")
+        default_symbol = str(cfg.get("symbol", "XRPUSDT")).upper()
+        try:
+            default_leverage = float(
+                cfg.get("leverage", self.settings.backtest.get("leverage", 1.0))
+            )
+        except (TypeError, ValueError):
+            default_leverage = 1.0
+
+        tokens = shlex.split(args or "")
+        if not tokens:
+            await _send(
+                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
+                ephemeral=True,
+            )
+            return
+
+        def _looks_like_symbol(value: str) -> bool:
+            return any(ch.isalpha() for ch in value)
+
+        if len(tokens) < 2:
+            await _send(
+                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
+                ephemeral=True,
+            )
+            return
+
+        side_token = tokens[0].lower()
+        if side_token in {"buy", "long", "l", "b"}:
+            side = "BUY"
+            position_side = "LONG"
+        elif side_token in {"sell", "short", "s"}:
+            side = "SELL"
+            position_side = "SHORT"
+        else:
+            await _send("Side must be long/short (or buy/sell).", ephemeral=True)
+            return
+
+        try:
+            usdt_amount = float(tokens[1].replace(",", ""))
+        except ValueError:
+            await _send("USDT amount must be a number.", ephemeral=True)
+            return
+        if usdt_amount <= 0:
+            await _send("USDT amount must be greater than 0.", ephemeral=True)
+            return
+
+        price: Optional[float] = None
+        symbol: Optional[str] = None
+        leverage: Optional[float] = None
+
+        for token in tokens[2:]:
+            text = token.strip()
+            if not text:
+                continue
+            lower = text.lower()
+            if lower.endswith("x") and leverage is None:
+                try:
+                    leverage = float(lower[:-1])
+                    continue
+                except ValueError:
+                    pass
+            if _looks_like_symbol(text) and symbol is None:
+                symbol = text.replace("/", "").replace("-", "").upper()
+                continue
+            if price is None:
+                try:
+                    price = float(text.replace(",", ""))
+                    continue
+                except ValueError:
+                    pass
+            if leverage is None:
+                try:
+                    leverage = float(text.replace(",", ""))
+                    continue
+                except ValueError:
+                    pass
+            await _send(f"Unrecognized token: `{text}`", ephemeral=True)
+            return
+
+        if symbol is None:
+            symbol = default_symbol
+        if leverage is None:
+            leverage = default_leverage
+        if leverage <= 0:
+            await _send("Leverage must be greater than 0.", ephemeral=True)
+            return
+        if price is not None and price <= 0:
+            await _send("Price must be greater than 0.", ephemeral=True)
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await _send(err, ephemeral=True)
+            return
+
+        available, wallet, current_price, note = await self._fetch_live_account_snapshot(
+            client, symbol
+        )
+        if current_price is None:
+            await _send(note or "Failed to fetch current price.", ephemeral=True)
+            return
+
+        if price is None:
+            price = current_price
+
+        maker_offset_bps = float(cfg.get("maker_offset_bps", 1.0) or 0.0)
+        order_price = self._apply_maker_offset(price, side, maker_offset_bps)
+
+        tick_size = 0.0
+        step_size = 0.0
+        try:
+            filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
+            tick_size = filters.tick_size
+            step_size = filters.step_size
+        except Exception:
+            pass
+
+        order_price = RealtimeRunner._round_price(order_price, tick_size, side)
+        if order_price <= 0:
+            await _send("Price invalid after rounding.", ephemeral=True)
+            return
+
+        qty = usdt_amount / order_price
+        qty = RealtimeRunner._round_step(qty, step_size)
+        if qty <= 0:
+            await _send("Order size too small after symbol rounding.", ephemeral=True)
+            return
+
+        draft = LiveOrderDraft(
+            symbol=symbol,
+            side=side,
+            position_side=position_side,
+            leverage=float(leverage),
+            usdt_amount=usdt_amount,
+            price=order_price,
+            qty=qty,
+            reduce_only=False,
+            maker_offset_bps=maker_offset_bps,
+        )
+
+        warning = ""
+        if available is not None and usdt_amount > available:
+            warning = (
+                f"\nWarning: amount {usdt_amount:,.2f} exceeds available "
+                f"{available:,.2f} USDT."
+            )
+
+        available_text = f"{available:,.2f}" if available is not None else "n/a"
+        wallet_text = f"{wallet:,.2f}" if wallet is not None else "n/a"
+        price_text = self._fmt_price(current_price if current_price is not None else price)
+        confirm_text = (
+            "Live futures order preview\n"
+            f"- Symbol: {symbol}\n"
+            f"- Side: {position_side}\n"
+            f"- Leverage: {float(leverage):.2f}x\n"
+            f"- Amount (USDT): {usdt_amount:,.2f}\n"
+            f"- Qty: {qty:.6g}\n"
+            f"- Order price (maker): {self._fmt_price(order_price)}\n"
+            f"- Current price: {price_text}\n"
+            f"- Available USDT: {available_text} (wallet {wallet_text})\n"
+            "- Margin: ISOLATED\n"
+            "- Mode: HEDGE"
+            f"{warning}"
+        )
+        if note:
+            confirm_text = f"{confirm_text}\nNote: {note}"
+        view = LiveOrderConfirmView(
+            self,
+            target.user.id if isinstance(target, discord.Interaction) else target.author.id,
+            draft,
+        )
+        await _send_with_view(confirm_text, view, ephemeral=isinstance(target, discord.Interaction))
+
     async def _realtime_text_command(
         self, ctx: commands.Context, group: str, *, args: str = ""
     ) -> None:
@@ -9159,6 +10544,26 @@ class BacktestBot(commands.Bot):
             p.name for p in self.setting_profiles_dir.glob("*.y*ml") if p.is_file()
         )
 
+    def _format_setting_profile_label(self, name: str) -> str:
+        profile = self._load_setting_profile(name)
+        display = name
+        description = None
+        if isinstance(profile, dict):
+            meta = profile.get("meta")
+            if isinstance(meta, dict):
+                meta_name = meta.get("name")
+                meta_description = meta.get("description")
+                if isinstance(meta_name, str) and meta_name.strip():
+                    display = meta_name.strip()
+                if isinstance(meta_description, str) and meta_description.strip():
+                    description = meta_description.strip()
+        label = display
+        if description:
+            label = f"{label} ({description})"
+        if display != name:
+            label = f"{label} [{name}]"
+        return label
+
     @staticmethod
     def _parse_saved_at(value: str) -> Optional[datetime]:
         text = value.strip()
@@ -9226,6 +10631,41 @@ class BacktestBot(commands.Bot):
         path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         return path, None
 
+    async def _apply_setting_profile(self, name: str) -> tuple[bool, str]:
+        profile = self._load_setting_profile(name)
+        if profile is None:
+            return False, "Profile not found."
+        data = profile.get("data")
+        backtest = profile.get("backtest")
+        strategy = profile.get("strategy")
+        if not isinstance(data, dict) or not isinstance(backtest, dict) or not isinstance(strategy, dict):
+            return False, "Profile is missing required sections (data/backtest/strategy)."
+        self.settings.data = copy.deepcopy(data)
+        self.settings.backtest = copy.deepcopy(backtest)
+        self.settings.strategy = copy.deepcopy(strategy)
+        save_settings(self.settings_path, self.settings)
+        await self._update_strategy_list_channel()
+
+        restart_lines: List[str] = []
+        for group in ("sim", "live"):
+            runner = self._runner_for_group(group)
+            running = bool(runner and getattr(runner, "is_running", lambda: False)())
+            if not running:
+                continue
+            self._stop_realtime_runner(group)
+            err = self._start_realtime_runner(group)
+            if err:
+                restart_lines.append(f"{group} restart failed: {err}")
+            else:
+                restart_lines.append(f"{group} runner restarted.")
+
+        message = f"Applied settings profile `{name}`."
+        if restart_lines:
+            message = message + "\n" + "\n".join(restart_lines)
+        else:
+            message = message + "\nNo runners were running; changes apply on next start."
+        return True, message
+
     async def setting_text(self, ctx: commands.Context, *, args: str = "") -> None:
         if ctx.guild is None:
             await ctx.reply("This command can only be used in a server channel.")
@@ -9240,7 +10680,8 @@ class BacktestBot(commands.Bot):
         if not tokens:
             await ctx.reply(
                 "Usage: `!setting show [name]`, `!setting edit section.key value`, "
-                "`!setting list`, `!setting save`, `!setting upload name`, "
+                "`!setting list`, `!setting save`, `!setting apply [name]`, "
+                "`!setting upload name`, "
                 "`!setting download`, `!setting delete name`"
             )
             return
@@ -9252,23 +10693,7 @@ class BacktestBot(commands.Bot):
                 return
             lines = []
             for name in profiles:
-                profile = self._load_setting_profile(name)
-                display = name
-                description = None
-                if isinstance(profile, dict):
-                    meta = profile.get("meta")
-                    if isinstance(meta, dict):
-                        meta_name = meta.get("name")
-                        meta_description = meta.get("description")
-                        if isinstance(meta_name, str) and meta_name.strip():
-                            display = meta_name.strip()
-                        if isinstance(meta_description, str) and meta_description.strip():
-                            description = meta_description.strip()
-                label = display
-                if description:
-                    label = f"{label} ({description})"
-                if display != name:
-                    label = f"{label} [{name}]"
+                label = self._format_setting_profile_label(name)
                 updated = self._format_setting_profile_updated_at(name)
                 if updated:
                     lines.append(f"- {label} (updated {updated})")
@@ -9280,6 +10705,23 @@ class BacktestBot(commands.Bot):
             view = SettingSaveChoiceView(self, ctx.author.id)
             message = await ctx.reply(
                 "Save current settings: choose new or overwrite.",
+                view=view,
+            )
+            view.message = message
+            return
+        if action == "apply":
+            profiles = self._list_setting_profiles()
+            if not profiles:
+                await ctx.reply("No saved setting profiles.")
+                return
+            if len(tokens) >= 2:
+                name = tokens[1]
+                ok, message = await self._apply_setting_profile(name)
+                await ctx.reply(message)
+                return
+            view = SettingApplyView(self, profiles, ctx.author.id)
+            message = await ctx.reply(
+                "Select a profile to apply.",
                 view=view,
             )
             view.message = message
@@ -9388,7 +10830,7 @@ class BacktestBot(commands.Bot):
             return
         await ctx.reply(
             "Unknown action. Use `show`, `edit`, `list`, `save`, "
-            "`upload`, `download`, or `delete`."
+            "`apply`, `upload`, `download`, or `delete`."
         )
 
     def _help_lines(self) -> List[str]:
@@ -9426,6 +10868,7 @@ class BacktestBot(commands.Bot):
             "- `!setting edit section.key value` : Edit a setting.",
             "- `!setting list` : List profiles.",
             "- `!setting save` : Save profile (new/overwrite).",
+            "- `!setting apply [name]` : Apply a saved profile.",
             "- `!setting upload name` : Save profile by name.",
             "- `!setting download` : Download current settings.",
             "- `!setting delete name` : Delete profile.",
@@ -9453,6 +10896,10 @@ class BacktestBot(commands.Bot):
             "- `!live apisecret [SECRET]` : Set API secret only.",
             "- `!live interval [5m]` : View/set live interval.",
             "- `!live symbol [BTCUSDT]` : View/set live symbol.",
+            "- `!order buy|sell qty [price] [symbol] [leverage] [reduce]` : Place live order.",
+            "- `!close` : Close an open live position (interactive).",
+            "- `!positions` : Show live open futures positions.",
+            "- `!assets` : Show futures + spot balances.",
         ]
         return lines
 
@@ -9829,6 +11276,7 @@ async def graph_text_command(ctx: commands.Context, *, args: str = "") -> None:
 async def setting_text_command(ctx: commands.Context, *, args: str = "") -> None:
     await _get_backtest_bot(ctx).setting_text(ctx, args=args)
 
+
 async def help_text_command(ctx: commands.Context) -> None:
     await _get_backtest_bot(ctx).help_text(ctx)
 
@@ -9839,3 +11287,19 @@ async def sim_text_command(ctx: commands.Context, *, args: str = "") -> None:
 
 async def live_text_command(ctx: commands.Context, *, args: str = "") -> None:
     await _get_backtest_bot(ctx).live_text(ctx, args=args)
+
+
+async def order_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).order_text(ctx, args=args)
+
+
+async def close_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).close_text(ctx, args=args)
+
+
+async def positions_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).positions_text(ctx, args=args)
+
+
+async def assets_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).assets_text(ctx, args=args)

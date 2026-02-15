@@ -491,6 +491,7 @@ class RealtimeRunner:
 
         side = "BUY" if direction > 0 else "SELL"
         reduce_only = False
+        position_side = "LONG" if direction > 0 else "SHORT"
         if trade_type in {"exit", "exit_partial"}:
             reduce_only = True
             side = "SELL" if direction > 0 else "BUY"
@@ -536,6 +537,7 @@ class RealtimeRunner:
                     remaining_qty,
                     adjusted_price,
                     reduce_only,
+                    position_side,
                 )
             except Exception:
                 return
