@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,27 @@ from backtest.engine import BacktestEngine
 from backtest.runner import _normalize_cheatkey_params
 from backtest.strategy_loader import get_strategy_class
 
+
+logger = logging.getLogger(__name__)
+
+
+def _format_http_error(exc: Exception) -> str:
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return ""
+    status = getattr(resp, "status_code", None)
+    body = ""
+    try:
+        body = resp.text
+    except Exception:
+        body = ""
+    if status is not None and body:
+        return f" status={status} body={body}"
+    if status is not None:
+        return f" status={status}"
+    if body:
+        return f" body={body}"
+    return ""
 
 _INTERVAL_SECONDS = {
     "1m": 60,
@@ -576,7 +598,14 @@ class RealtimeRunner:
             raw_positions = await asyncio.to_thread(
                 self.binance.get_position_risk, self.symbol
             )
-        except Exception:
+        except Exception as exc:
+            details = _format_http_error(exc)
+            logger.warning(
+                "Exchange position sync failed for %s: %s.%s",
+                self.symbol,
+                exc,
+                details,
+            )
             return self._exchange_positions
         exchange_positions = self._parse_exchange_positions(raw_positions)
         try:
@@ -584,8 +613,11 @@ class RealtimeRunner:
             parsed_account = self._parse_exchange_account(raw_account)
             if parsed_account:
                 self._exchange_balance = parsed_account
-        except Exception:
-            pass
+            else:
+                logger.warning("Exchange account payload parsed empty.")
+        except Exception as exc:
+            details = _format_http_error(exc)
+            logger.warning("Exchange account sync failed: %s.%s", exc, details)
         self._exchange_positions = exchange_positions
         self._last_exchange_sync = time.time()
         self._record_position_sync(engine_positions, exchange_positions)

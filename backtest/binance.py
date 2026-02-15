@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import requests
+from urllib.parse import urlencode
 
 
 @dataclass
@@ -31,8 +32,11 @@ class BinanceFuturesClient:
         self.timeout = timeout
         self._symbol_filters: Dict[str, SymbolFilters] = {}
 
-    def _sign(self, params: Dict[str, Any]) -> str:
-        query = "&".join(f"{key}={params[key]}" for key in sorted(params))
+    def _sign(self, params: list[tuple[str, Any]] | Dict[str, Any]) -> str:
+        if isinstance(params, dict):
+            query = urlencode(params, doseq=True)
+        else:
+            query = urlencode(params, doseq=True)
         return hmac.new(
             self.api_secret.encode("utf-8"),
             query.encode("utf-8"),
@@ -46,17 +50,23 @@ class BinanceFuturesClient:
         params: Optional[Dict[str, Any]] = None,
         signed: bool = False,
     ) -> Any:
-        params = dict(params or {})
+        base_params = dict(params or {})
         headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
+        request_params: Dict[str, Any] | list[tuple[str, Any]]
         if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = self.recv_window
-            params["signature"] = self._sign(params)
+            param_items = list(base_params.items())
+            param_items.append(("timestamp", int(time.time() * 1000)))
+            param_items.append(("recvWindow", self.recv_window))
+            signature = self._sign(param_items)
+            param_items.append(("signature", signature))
+            request_params = param_items
+        else:
+            request_params = base_params
         url = f"{self.base_url}{path}"
         resp = requests.request(
             method,
             url,
-            params=params,
+            params=request_params,
             headers=headers,
             timeout=self.timeout,
         )
