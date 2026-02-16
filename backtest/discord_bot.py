@@ -5,6 +5,7 @@ import copy
 import csv
 import json
 import logging
+import math
 import random
 import re
 import shlex
@@ -436,7 +437,7 @@ class LiveOrderModal(Modal):
             max_length=10,
         )
         self.usdt_amount = TextInput(
-            label="Amount (USDT)",
+            label="Amount (USDT, margin)",
             placeholder="e.g. 10",
             required=True,
             max_length=20,
@@ -3613,6 +3614,25 @@ class BacktestBot(commands.Bot):
             self.add_command(command)
 
     @staticmethod
+    def _estimate_min_usdt_for_notional(
+        min_notional: float,
+        price: float,
+        step_size: float,
+        leverage: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        if min_notional <= 0 or price <= 0:
+            return None
+        raw_qty = min_notional / price
+        if step_size and step_size > 0:
+            steps = math.ceil((raw_qty / step_size) - 1e-12)
+            qty = steps * step_size
+        else:
+            qty = raw_qty
+        required_notional = qty * price
+        required_margin = required_notional / leverage if leverage > 0 else required_notional
+        return qty, required_notional, required_margin
+
+    @staticmethod
     def _split_message(message: str, limit: int = 2000) -> List[str]:
         if not message:
             return [""]
@@ -5970,17 +5990,29 @@ class BacktestBot(commands.Bot):
                 if qty <= 0 or diff > 0.01:
                     qty = expected_qty
         min_notional = None
+        step_size = 0.0
         try:
             filters = await asyncio.to_thread(client.get_symbol_filters, draft.symbol)
             min_notional = filters.min_notional
+            step_size = filters.step_size
         except Exception:
             pass
         if min_notional and draft.price > 0:
             rounded_notional = qty * draft.price
             if rounded_notional < min_notional:
+                min_hint = ""
+                estimate = self._estimate_min_usdt_for_notional(
+                    min_notional, draft.price, step_size, float(draft.leverage)
+                )
+                if estimate is not None:
+                    min_qty, required_notional, required_margin = estimate
+                    min_hint = (
+                        f" Minimum margin for this price/step/leverage: {required_margin:,.4g} "
+                        f"USDT (qty {min_qty:.6g}, notional {required_notional:,.4g})."
+                    )
                 await _send(
                     f"Live order blocked: notional must be at least {min_notional:,.4g} "
-                    f"USDT (current {rounded_notional:,.4g} USDT).",
+                    f"USDT (current {rounded_notional:,.4g} USDT).{min_hint}",
                     ephemeral=True,
                 )
                 return
@@ -10942,9 +10974,19 @@ class BacktestBot(commands.Bot):
             return
         rounded_notional = qty * order_price
         if min_notional and rounded_notional < min_notional:
+            min_hint = ""
+            estimate = self._estimate_min_usdt_for_notional(
+                min_notional, order_price, step_size, float(leverage)
+            )
+            if estimate is not None:
+                min_qty, required_notional, required_margin = estimate
+                min_hint = (
+                    f" Minimum margin for this price/step/leverage: {required_margin:,.4g} "
+                    f"USDT (qty {min_qty:.6g}, notional {required_notional:,.4g})."
+                )
             await _send(
                 f"Order notional must be at least {min_notional:,.4g} USDT. "
-                f"Current notional: {rounded_notional:,.4g} USDT.",
+                f"Current notional: {rounded_notional:,.4g} USDT.{min_hint}",
                 ephemeral=True,
             )
             return
