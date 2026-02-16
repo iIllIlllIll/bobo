@@ -45,9 +45,13 @@ from backtest.plot import (
     create_equity_price_chart,
     create_monthly_return_stability_chart,
     create_equity_price_mdd_chart,
+    create_entry_minute_win_rate_chart,
+    create_entry_minute_tp_rate_chart,
     create_grid_heatmap,
     create_trade_pnl_curve,
     create_trade_snapshot_chart,
+    compute_entry_minute_win_rate,
+    compute_entry_minute_tp_rate,
     compute_monthly_return_stats,
 )
 
@@ -471,16 +475,14 @@ class LiveOrderModal(Modal):
                 ephemeral=True,
             )
             return
-        args = " ".join(
-            [
-                self.side.value.strip(),
-                self.usdt_amount.value.strip(),
-                self.price.value.strip(),
-                self.symbol.value.strip(),
-                self.leverage.value.strip(),
-            ]
-        ).strip()
-        await self.bot._handle_live_order(interaction, args)
+        modal_fields = {
+            "side": self.side.value,
+            "usdt_amount": self.usdt_amount.value,
+            "price": self.price.value,
+            "symbol": self.symbol.value,
+            "leverage": self.leverage.value,
+        }
+        await self.bot._handle_live_order(interaction, "", modal_fields=modal_fields)
 
 
 class SettingOverwriteView(View):
@@ -5580,7 +5582,7 @@ class BacktestBot(commands.Bot):
     @classmethod
     def _is_filter_error(cls, exc: Exception) -> bool:
         code, msg, body = cls._extract_binance_error(exc)
-        if code in {-1013, -4016, -1111}:
+        if code in {-1013, -4016, -1111, -4164}:
             return True
         text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
         return (
@@ -5967,6 +5969,21 @@ class BacktestBot(commands.Bot):
                 diff = abs(qty - expected_qty) / expected_qty if qty > 0 else 1.0
                 if qty <= 0 or diff > 0.01:
                     qty = expected_qty
+        min_notional = None
+        try:
+            filters = await asyncio.to_thread(client.get_symbol_filters, draft.symbol)
+            min_notional = filters.min_notional
+        except Exception:
+            pass
+        if min_notional and draft.price > 0:
+            rounded_notional = qty * draft.price
+            if rounded_notional < min_notional:
+                await _send(
+                    f"Live order blocked: notional must be at least {min_notional:,.4g} "
+                    f"USDT (current {rounded_notional:,.4g} USDT).",
+                    ephemeral=True,
+                )
+                return
 
         result = await self._place_limit_maker_with_retry(
             client=client,
@@ -7029,6 +7046,10 @@ class BacktestBot(commands.Bot):
         data_label: str,
         monthly_df: pd.DataFrame,
         stats: Dict[str, Any],
+        entry_minute_df: pd.DataFrame,
+        entry_minute_stats: Dict[str, Any],
+        entry_minute_tp_df: pd.DataFrame,
+        entry_minute_tp_stats: Dict[str, Any],
     ) -> str:
         months = int(stats.get("months", 0) or 0)
         lines = [
@@ -7040,7 +7061,50 @@ class BacktestBot(commands.Bot):
         ]
         if months <= 0:
             lines.append("- No monthly returns available.")
-            return "\n".join(lines)
+            monthly_output = "\n".join(lines)
+            entry_lines = [
+                "━━━━━━━━━━━━━━━━━━",
+                "Entry minute win rate (by entry time)",
+            ]
+            if entry_minute_df.empty:
+                entry_lines.append("- n/a")
+            else:
+                total_trades = int(entry_minute_stats.get("trades", 0) or 0)
+                overall_wr = float(entry_minute_stats.get("win_rate", 0.0) or 0.0)
+                entry_lines.append(f"- Trades: {total_trades} | Win rate: {overall_wr:.1f}%")
+                for _, row in entry_minute_df.iterrows():
+                    label = str(row.get("label", "")).zfill(2)
+                    win_rate = float(row.get("win_rate", 0.0))
+                    wins = int(row.get("wins", 0))
+                    total = int(row.get("total", 0))
+                    entry_lines.append(f"- {label}: {win_rate:.1f}% (W {wins} / T {total})")
+            entry_lines.append("━━━━━━━━━━━━━━━━━━")
+            entry_lines.append("Entry minute TP reach rate (by entry time)")
+            if entry_minute_tp_df.empty:
+                total_trades = int(entry_minute_tp_stats.get("trades", 0) or 0)
+                overall_tp = float(entry_minute_tp_stats.get("tp_rate", 0.0) or 0.0)
+                covered = int(entry_minute_tp_stats.get("trades_with_time", total_trades) or 0)
+                if total_trades > 0:
+                    entry_lines.append(
+                        f"- Trades: {total_trades} (minute-covered {covered}) | TP rate: {overall_tp:.1f}%"
+                    )
+                    entry_lines.append("- minute breakdown: n/a")
+                else:
+                    entry_lines.append("- n/a")
+            else:
+                total_trades = int(entry_minute_tp_stats.get("trades", 0) or 0)
+                overall_tp = float(entry_minute_tp_stats.get("tp_rate", 0.0) or 0.0)
+                covered = int(entry_minute_tp_stats.get("trades_with_time", total_trades) or 0)
+                entry_lines.append(
+                    f"- Trades: {total_trades} (minute-covered {covered}) | TP rate: {overall_tp:.1f}%"
+                )
+                for _, row in entry_minute_tp_df.iterrows():
+                    label = str(row.get("label", "")).zfill(2)
+                    tp_rate = float(row.get("tp_rate", 0.0))
+                    tp_hits = int(row.get("tp_hits", 0))
+                    total = int(row.get("total", 0))
+                    entry_lines.append(f"- {label}: {tp_rate:.1f}% (TP {tp_hits} / T {total})")
+            return "\n".join([monthly_output, *entry_lines])
 
         mean = stats.get("mean", 0.0)
         median = stats.get("median", 0.0)
@@ -7065,17 +7129,61 @@ class BacktestBot(commands.Bot):
         lines.append("Monthly returns")
         if monthly_df.empty:
             lines.append("- n/a")
-            return "\n".join(lines)
+            monthly_output = "\n".join(lines)
+        else:
+            for _, row in monthly_df.iterrows():
+                month = str(row.get("month", ""))
+                value = row.get("return_pct", np.nan)
+                if value is None or not np.isfinite(value):
+                    lines.append(f"- {month}: n/a")
+                else:
+                    lines.append(f"- {month}: {float(value):.2f}%")
+            monthly_output = "\n".join(lines)
 
-        for _, row in monthly_df.iterrows():
-            month = str(row.get("month", ""))
-            value = row.get("return_pct", np.nan)
-            if value is None or not np.isfinite(value):
-                lines.append(f"- {month}: n/a")
+        entry_lines = [
+            "━━━━━━━━━━━━━━━━━━",
+            "Entry minute win rate (by entry time)",
+        ]
+        if entry_minute_df.empty:
+            entry_lines.append("- n/a")
+        else:
+            total_trades = int(entry_minute_stats.get("trades", 0) or 0)
+            overall_wr = float(entry_minute_stats.get("win_rate", 0.0) or 0.0)
+            entry_lines.append(f"- Trades: {total_trades} | Win rate: {overall_wr:.1f}%")
+            for _, row in entry_minute_df.iterrows():
+                label = str(row.get("label", "")).zfill(2)
+                win_rate = float(row.get("win_rate", 0.0))
+                wins = int(row.get("wins", 0))
+                total = int(row.get("total", 0))
+                entry_lines.append(f"- {label}: {win_rate:.1f}% (W {wins} / T {total})")
+        entry_lines.append("━━━━━━━━━━━━━━━━━━")
+        entry_lines.append("Entry minute TP reach rate (by entry time)")
+        if entry_minute_tp_df.empty:
+            total_trades = int(entry_minute_tp_stats.get("trades", 0) or 0)
+            overall_tp = float(entry_minute_tp_stats.get("tp_rate", 0.0) or 0.0)
+            covered = int(entry_minute_tp_stats.get("trades_with_time", total_trades) or 0)
+            if total_trades > 0:
+                entry_lines.append(
+                    f"- Trades: {total_trades} (minute-covered {covered}) | TP rate: {overall_tp:.1f}%"
+                )
+                entry_lines.append("- minute breakdown: n/a")
             else:
-                lines.append(f"- {month}: {float(value):.2f}%")
+                entry_lines.append("- n/a")
+        else:
+            total_trades = int(entry_minute_tp_stats.get("trades", 0) or 0)
+            overall_tp = float(entry_minute_tp_stats.get("tp_rate", 0.0) or 0.0)
+            covered = int(entry_minute_tp_stats.get("trades_with_time", total_trades) or 0)
+            entry_lines.append(
+                f"- Trades: {total_trades} (minute-covered {covered}) | TP rate: {overall_tp:.1f}%"
+            )
+            for _, row in entry_minute_tp_df.iterrows():
+                label = str(row.get("label", "")).zfill(2)
+                tp_rate = float(row.get("tp_rate", 0.0))
+                tp_hits = int(row.get("tp_hits", 0))
+                total = int(row.get("total", 0))
+                entry_lines.append(f"- {label}: {tp_rate:.1f}% (TP {tp_hits} / T {total})")
 
-        return "\n".join(lines)
+        return "\n".join([monthly_output, *entry_lines])
 
     async def _run_grid_from_interaction(
         self,
@@ -7521,10 +7629,16 @@ class BacktestBot(commands.Bot):
         self._last_backtest = {"result": result, "data": data}
         data_pattern = settings_copy.data.get("file_pattern", "*.csv")
         monthly_df, stats = compute_monthly_return_stats(result)
+        entry_minute_df, entry_minute_stats = compute_entry_minute_win_rate(result)
+        entry_minute_tp_df, entry_minute_tp_stats = compute_entry_minute_tp_rate(result)
         message = BacktestBot._format_costom4_output(
             data_label=str(data_pattern),
             monthly_df=monthly_df,
             stats=stats,
+            entry_minute_df=entry_minute_df,
+            entry_minute_stats=entry_minute_stats,
+            entry_minute_tp_df=entry_minute_tp_df,
+            entry_minute_tp_stats=entry_minute_tp_stats,
         )
 
         with tempfile.NamedTemporaryFile(
@@ -7538,6 +7652,30 @@ class BacktestBot(commands.Bot):
             result,
             output_path,
             title=f"Monthly return stability ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_entry_minute_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            minute_output_path = Path(tmp_file.name)
+        entry_minute_chart = await asyncio.to_thread(
+            create_entry_minute_win_rate_chart,
+            result,
+            minute_output_path,
+            title=f"Entry minute win rate ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_entry_minute_tp_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_output_path = Path(tmp_file.name)
+        entry_minute_tp_chart = await asyncio.to_thread(
+            create_entry_minute_tp_rate_chart,
+            result,
+            tp_output_path,
+            title=f"Entry minute TP reach rate ({data_pattern})",
         )
         equity_price_chart = None
         if isinstance(data, pd.DataFrame) and not data.empty:
@@ -7566,6 +7704,10 @@ class BacktestBot(commands.Bot):
         chart_paths = []
         if chart_path:
             chart_paths.append(chart_path)
+        if entry_minute_chart:
+            chart_paths.append(entry_minute_chart)
+        if entry_minute_tp_chart:
+            chart_paths.append(entry_minute_tp_chart)
         if equity_price_chart:
             chart_paths.append(equity_price_chart)
         if not chart_paths:
@@ -9517,10 +9659,16 @@ class BacktestBot(commands.Bot):
         self._last_backtest = {"result": result, "data": data}
         data_pattern = settings_copy.data.get("file_pattern", "*.csv")
         monthly_df, stats = compute_monthly_return_stats(result)
+        entry_minute_df, entry_minute_stats = compute_entry_minute_win_rate(result)
+        entry_minute_tp_df, entry_minute_tp_stats = compute_entry_minute_tp_rate(result)
         message = BacktestBot._format_costom4_output(
             data_label=str(data_pattern),
             monthly_df=monthly_df,
             stats=stats,
+            entry_minute_df=entry_minute_df,
+            entry_minute_stats=entry_minute_stats,
+            entry_minute_tp_df=entry_minute_tp_df,
+            entry_minute_tp_stats=entry_minute_tp_stats,
         )
 
         with tempfile.NamedTemporaryFile(
@@ -9534,6 +9682,30 @@ class BacktestBot(commands.Bot):
             result,
             output_path,
             title=f"Monthly return stability ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_entry_minute_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            minute_output_path = Path(tmp_file.name)
+        entry_minute_chart = await asyncio.to_thread(
+            create_entry_minute_win_rate_chart,
+            result,
+            minute_output_path,
+            title=f"Entry minute win rate ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_entry_minute_tp_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_output_path = Path(tmp_file.name)
+        entry_minute_tp_chart = await asyncio.to_thread(
+            create_entry_minute_tp_rate_chart,
+            result,
+            tp_output_path,
+            title=f"Entry minute TP reach rate ({data_pattern})",
         )
         equity_price_chart = None
         if isinstance(data, pd.DataFrame) and not data.empty:
@@ -9561,6 +9733,10 @@ class BacktestBot(commands.Bot):
         chart_paths = []
         if chart_path:
             chart_paths.append(chart_path)
+        if entry_minute_chart:
+            chart_paths.append(entry_minute_chart)
+        if entry_minute_tp_chart:
+            chart_paths.append(entry_minute_tp_chart)
         if equity_price_chart:
             chart_paths.append(equity_price_chart)
         if not chart_paths:
@@ -10468,6 +10644,8 @@ class BacktestBot(commands.Bot):
         self,
         target: Union[discord.Interaction, commands.Context],
         args: str,
+        *,
+        modal_fields: Optional[Dict[str, str]] = None,
     ) -> None:
         async def _send(message: str, *, ephemeral: bool = False) -> None:
             if isinstance(target, discord.Interaction):
@@ -10537,34 +10715,8 @@ class BacktestBot(commands.Bot):
         except (TypeError, ValueError):
             default_leverage = 1.0
 
-        tokens = shlex.split(args or "")
-        if not tokens:
-            await _send(
-                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
-                ephemeral=True,
-            )
-            return
-
         def _looks_like_symbol(value: str) -> bool:
             return any(ch.isalpha() for ch in value)
-
-        if len(tokens) < 2:
-            await _send(
-                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
-                ephemeral=True,
-            )
-            return
-
-        side_token = tokens[0].lower()
-        if side_token in {"buy", "long", "l", "b"}:
-            side = "BUY"
-            position_side = "LONG"
-        elif side_token in {"sell", "short", "s"}:
-            side = "SELL"
-            position_side = "SHORT"
-        else:
-            await _send("Side must be long/short (or buy/sell).", ephemeral=True)
-            return
 
         def _extract_float(text: str) -> Optional[float]:
             match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text.replace(",", ""))
@@ -10579,78 +10731,147 @@ class BacktestBot(commands.Bot):
         price: Optional[float] = None
         symbol: Optional[str] = None
         leverage: Optional[float] = None
+        side = ""
+        position_side = ""
 
-        side_tokens = {
-            "buy",
-            "sell",
-            "long",
-            "short",
-            "l",
-            "s",
-            "b",
-        }
-        leverage_tokens = {"leverage", "lev", "레버리지"}
-        amount_tokens = {"usdt", "usd", "amount", "원금", "증거금"}
-        skip_indices: Set[int] = set()
+        if modal_fields is not None:
+            side_text = (modal_fields.get("side") or "").strip().lower()
+            if side_text in {"buy", "long", "l", "b"}:
+                side = "BUY"
+                position_side = "LONG"
+            elif side_text in {"sell", "short", "s"}:
+                side = "SELL"
+                position_side = "SHORT"
+            else:
+                await _send("Side must be long/short (or buy/sell).", ephemeral=True)
+                return
 
-        for idx, token in enumerate(tokens):
-            if token.lower() in side_tokens:
-                skip_indices.add(idx)
+            amount_text = (modal_fields.get("usdt_amount") or "").strip()
+            if not amount_text:
+                await _send("USDT amount must be a number.", ephemeral=True)
+                return
+            amount = _extract_float(amount_text)
+            if amount is None:
+                await _send("USDT amount must be a number.", ephemeral=True)
+                return
 
-        for idx, token in enumerate(tokens):
-            if idx in skip_indices:
-                continue
-            text = token.strip()
-            if not text:
-                continue
-            lower = text.lower()
-            if lower.endswith("x") and leverage is None:
-                parsed = _extract_float(lower[:-1])
-                if parsed is not None:
-                    leverage = parsed
+            price_text = (modal_fields.get("price") or "").strip()
+            if price_text:
+                price = _extract_float(price_text)
+                if price is None:
+                    await _send("Price must be a number.", ephemeral=True)
+                    return
+
+            symbol_text = (modal_fields.get("symbol") or "").strip()
+            if symbol_text and _looks_like_symbol(symbol_text):
+                symbol = symbol_text.replace("/", "").replace("-", "").upper()
+
+            leverage_text = (modal_fields.get("leverage") or "").strip()
+            if leverage_text:
+                leverage = _extract_float(leverage_text)
+                if leverage is None:
+                    await _send("Leverage must be a number.", ephemeral=True)
+                    return
+        else:
+            tokens = shlex.split(args or "")
+            if not tokens:
+                await _send(
+                    "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
+                    ephemeral=True,
+                )
+                return
+
+            if len(tokens) < 2:
+                await _send(
+                    "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
+                    ephemeral=True,
+                )
+                return
+
+            side_token = tokens[0].lower()
+            if side_token in {"buy", "long", "l", "b"}:
+                side = "BUY"
+                position_side = "LONG"
+            elif side_token in {"sell", "short", "s"}:
+                side = "SELL"
+                position_side = "SHORT"
+            else:
+                await _send("Side must be long/short (or buy/sell).", ephemeral=True)
+                return
+
+            side_tokens = {
+                "buy",
+                "sell",
+                "long",
+                "short",
+                "l",
+                "s",
+                "b",
+            }
+            leverage_tokens = {"leverage", "lev", "레버리지"}
+            amount_tokens = {"usdt", "usd", "amount", "원금", "증거금"}
+            skip_indices: Set[int] = set()
+
+            for idx, token in enumerate(tokens):
+                if token.lower() in side_tokens:
+                    skip_indices.add(idx)
+
+            for idx, token in enumerate(tokens):
+                if idx in skip_indices:
                     continue
-            if any(key in lower for key in leverage_tokens) and leverage is None:
-                parsed = _extract_float(text)
-                if parsed is None and idx + 1 < len(tokens):
-                    parsed = _extract_float(tokens[idx + 1])
-                    if parsed is not None:
-                        skip_indices.add(idx + 1)
-                if parsed is not None:
-                    leverage = parsed
+                text = token.strip()
+                if not text:
                     continue
-            if any(key in lower for key in amount_tokens) and amount is None:
-                parsed = _extract_float(text)
-                if parsed is None and idx + 1 < len(tokens):
-                    parsed = _extract_float(tokens[idx + 1])
+                lower = text.lower()
+                if lower.endswith("x") and leverage is None:
+                    parsed = _extract_float(lower[:-1])
                     if parsed is not None:
-                        skip_indices.add(idx + 1)
-                if parsed is not None:
+                        leverage = parsed
+                        continue
+                if any(key in lower for key in leverage_tokens) and leverage is None:
+                    parsed = _extract_float(text)
+                    if parsed is None and idx + 1 < len(tokens):
+                        parsed = _extract_float(tokens[idx + 1])
+                        if parsed is not None:
+                            skip_indices.add(idx + 1)
+                    if parsed is not None:
+                        leverage = parsed
+                        continue
+                if any(key in lower for key in amount_tokens) and amount is None:
+                    parsed = _extract_float(text)
+                    if parsed is None and idx + 1 < len(tokens):
+                        parsed = _extract_float(tokens[idx + 1])
+                        if parsed is not None:
+                            skip_indices.add(idx + 1)
+                    if parsed is not None:
+                        amount = parsed
+                        continue
+
+            for idx, token in enumerate(tokens):
+                if idx in skip_indices:
+                    continue
+                text = token.strip()
+                if not text:
+                    continue
+                if _looks_like_symbol(text) and symbol is None:
+                    lower = text.lower()
+                    if lower not in amount_tokens and not any(
+                        key in lower for key in leverage_tokens
+                    ):
+                        symbol = text.replace("/", "").replace("-", "").upper()
+                        continue
+                parsed = _extract_float(text)
+                if parsed is None:
+                    continue
+                if amount is None:
                     amount = parsed
                     continue
-
-        for idx, token in enumerate(tokens):
-            if idx in skip_indices:
-                continue
-            text = token.strip()
-            if not text:
-                continue
-            if _looks_like_symbol(text) and symbol is None:
-                lower = text.lower()
-                if lower not in amount_tokens and not any(key in lower for key in leverage_tokens):
-                    symbol = text.replace("/", "").replace("-", "").upper()
+                if price is None:
+                    price = parsed
                     continue
-            parsed = _extract_float(text)
-            if parsed is None:
-                continue
-            if amount is None:
-                amount = parsed
-                continue
-            if price is None:
-                price = parsed
-                continue
-            if leverage is None:
-                leverage = parsed
-                continue
+                if leverage is None:
+                    leverage = parsed
+                    continue
 
         if amount is None:
             await _send("USDT amount must be a number.", ephemeral=True)
@@ -10691,12 +10912,14 @@ class BacktestBot(commands.Bot):
 
         tick_size = 0.0
         step_size = 0.0
+        min_notional = None
         min_price = None
         max_price = None
         try:
             filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
             tick_size = filters.tick_size
             step_size = filters.step_size
+            min_notional = filters.min_notional
             min_price, max_price = self._price_bounds(
                 float(current_price), filters
             )
@@ -10716,6 +10939,14 @@ class BacktestBot(commands.Bot):
         qty = RealtimeRunner._round_step(qty, step_size)
         if qty <= 0:
             await _send("Order size too small after symbol rounding.", ephemeral=True)
+            return
+        rounded_notional = qty * order_price
+        if min_notional and rounded_notional < min_notional:
+            await _send(
+                f"Order notional must be at least {min_notional:,.4g} USDT. "
+                f"Current notional: {rounded_notional:,.4g} USDT.",
+                ephemeral=True,
+            )
             return
 
         draft = LiveOrderDraft(

@@ -116,7 +116,9 @@ def create_equity_price_chart(
     if equity_df.empty:
         return None
 
-    price_df = data[["timestamp", "close"]].copy()
+    has_volume = "volume" in data.columns
+    price_columns = ["timestamp", "close"] + (["volume"] if has_volume else [])
+    price_df = data[price_columns].copy()
     price_df["timestamp"] = pd.to_datetime(price_df["timestamp"], errors="coerce")
     if pd.api.types.is_datetime64tz_dtype(price_df["timestamp"]):
         price_df["timestamp"] = price_df["timestamp"].dt.tz_localize(None)
@@ -136,8 +138,21 @@ def create_equity_price_chart(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax2 = ax1.twinx()
+    if has_volume:
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(10, 6),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
+        ax1 = axes[0]
+        ax2 = ax1.twinx()
+        ax_vol = axes[1]
+    else:
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+        ax2 = ax1.twinx()
+        ax_vol = None
 
     ax1.plot(
         merged["timestamp"],
@@ -158,11 +173,24 @@ def create_equity_price_chart(
     ax1.set_ylabel("Equity")
     ax2.set_ylabel("Price")
     ax1.grid(True, alpha=0.3)
-    ax1.set_title("Equity vs Price")
+    ax1.set_title("Equity vs Price" + (" (with Volume)" if has_volume else ""))
 
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
     ax1.legend(lines_1 + lines_2, labels_1 + labels_2, fontsize=8, loc="best")
+
+    if has_volume and ax_vol is not None:
+        volumes = merged["volume"].astype(float)
+        ax_vol.plot(
+            merged["timestamp"],
+            volumes,
+            color="#7f7f7f",
+            linewidth=1.0,
+            alpha=0.8,
+            label="Volume",
+        )
+        ax_vol.set_ylabel("Volume")
+        ax_vol.grid(True, axis="y", alpha=0.25)
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,6 +559,156 @@ def compute_monthly_return_stats(
     return monthly_df, stats
 
 
+def compute_entry_minute_win_rate(
+    result: BacktestResult,
+) -> tuple[pd.DataFrame, dict]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    if not exit_trades:
+        empty_df = pd.DataFrame(
+            columns=["minute", "label", "wins", "losses", "total", "win_rate"]
+        )
+        return empty_df, {"trades": 0, "minutes": 0}
+
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            continue
+        ts = pd.to_datetime(entry_time, errors="coerce")
+        if pd.isna(ts):
+            continue
+        if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+        minute = int(ts.minute)
+        pnl = trade.get("pnl")
+        if pnl is None:
+            ret = trade.get("return")
+            if ret is None:
+                continue
+            win = float(ret) > 0.0
+        else:
+            win = float(pnl) > 0.0
+        rows.append({"minute": minute, "win": win})
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=["minute", "label", "wins", "losses", "total", "win_rate"]
+        )
+        return empty_df, {"trades": 0, "minutes": 0}
+
+    df = pd.DataFrame(rows)
+    grouped = df.groupby("minute", sort=True)
+    out_rows: list[dict[str, Any]] = []
+    for minute, group in grouped:
+        total = int(len(group))
+        wins = int(group["win"].sum())
+        losses = total - wins
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+        out_rows.append(
+            {
+                "minute": int(minute),
+                "label": f"{int(minute):02d}",
+                "wins": wins,
+                "losses": losses,
+                "total": total,
+                "win_rate": win_rate,
+            }
+        )
+
+    minute_df = pd.DataFrame(out_rows).sort_values("minute")
+    total_trades = int(minute_df["total"].sum()) if not minute_df.empty else 0
+    overall_win_rate = (
+        float(minute_df["wins"].sum()) / float(total_trades) * 100.0 if total_trades > 0 else 0.0
+    )
+    stats = {"trades": total_trades, "minutes": int(len(minute_df)), "win_rate": overall_win_rate}
+    return minute_df, stats
+
+
+def _is_tp_reason(reason: Any) -> bool:
+    if reason is None:
+        return False
+    text = str(reason).lower()
+    return "take_profit" in text or "rr_tp" in text
+
+
+def compute_entry_minute_tp_rate(
+    result: BacktestResult,
+) -> tuple[pd.DataFrame, dict]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    total_exit_trades = int(len(exit_trades))
+    tp_hits_all = int(
+        sum(1 for trade in exit_trades if _is_tp_reason(trade.get("exit_reason")))
+    )
+    overall_tp_rate = (
+        float(tp_hits_all) / float(total_exit_trades) * 100.0
+        if total_exit_trades > 0
+        else 0.0
+    )
+    if not exit_trades:
+        empty_df = pd.DataFrame(
+            columns=["minute", "label", "tp_hits", "total", "tp_rate"]
+        )
+        return empty_df, {
+            "trades": 0,
+            "trades_with_time": 0,
+            "minutes": 0,
+            "tp_rate": 0.0,
+        }
+
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            continue
+        ts = pd.to_datetime(entry_time, errors="coerce")
+        if pd.isna(ts):
+            continue
+        if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+        minute = int(ts.minute)
+        reason = trade.get("exit_reason")
+        tp_hit = _is_tp_reason(reason)
+        rows.append({"minute": minute, "tp_hit": tp_hit})
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=["minute", "label", "tp_hits", "total", "tp_rate"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "minutes": 0,
+            "tp_rate": overall_tp_rate,
+        }
+
+    df = pd.DataFrame(rows)
+    grouped = df.groupby("minute", sort=True)
+    out_rows: list[dict[str, Any]] = []
+    for minute, group in grouped:
+        total = int(len(group))
+        tp_hits = int(group["tp_hit"].sum())
+        tp_rate = (tp_hits / total * 100.0) if total > 0 else 0.0
+        out_rows.append(
+            {
+                "minute": int(minute),
+                "label": f"{int(minute):02d}",
+                "tp_hits": tp_hits,
+                "total": total,
+                "tp_rate": tp_rate,
+            }
+        )
+
+    minute_df = pd.DataFrame(out_rows).sort_values("minute")
+    covered_trades = int(minute_df["total"].sum()) if not minute_df.empty else 0
+    stats = {
+        "trades": total_exit_trades,
+        "trades_with_time": covered_trades,
+        "minutes": int(len(minute_df)),
+        "tp_rate": overall_tp_rate,
+    }
+    return minute_df, stats
+
+
 def create_monthly_return_stability_chart(
     result: BacktestResult,
     output_path: Path,
@@ -599,6 +777,140 @@ def create_monthly_return_stability_chart(
         if np.isfinite(stats.get("cv", np.nan)):
             stats_lines.append(f"CV      {stats.get('cv', 0.0):.2f}")
 
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_entry_minute_win_rate_chart(
+    result: BacktestResult,
+    output_path: Path,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    minute_df, stats = compute_entry_minute_win_rate(result)
+    if minute_df.empty:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = minute_df["label"].astype(str).to_list()
+    win_rates = minute_df["win_rate"].astype(float).to_list()
+    totals = minute_df["total"].astype(int).to_list()
+
+    x = np.arange(len(labels))
+    colors = ["#2ca02c" if rate >= 50.0 else "#d62728" for rate in win_rates]
+
+    fig_width = 9.5 if len(labels) <= 16 else min(15.0, 7.5 + len(labels) * 0.35)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+    bars = ax.bar(x, win_rates, color=colors, alpha=0.85)
+    ax.set_ylim(0, 100)
+    ax.set_title(title or "Entry minute win rate")
+    ax.set_ylabel("Win rate (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+
+    for idx, bar in enumerate(bars):
+        height = bar.get_height()
+        total = totals[idx]
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            min(100, height + 2.0),
+            f"{height:.1f}%\nT {total}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#2c2c2c",
+        )
+
+    stats_lines = [
+        f"Trades  {stats.get('trades', 0)}",
+        f"Minutes {stats.get('minutes', 0)}",
+        f"WinRate {stats.get('win_rate', 0.0):.1f}%",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_entry_minute_tp_rate_chart(
+    result: BacktestResult,
+    output_path: Path,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    minute_df, stats = compute_entry_minute_tp_rate(result)
+    if minute_df.empty:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = minute_df["label"].astype(str).to_list()
+    tp_rates = minute_df["tp_rate"].astype(float).to_list()
+    totals = minute_df["total"].astype(int).to_list()
+
+    x = np.arange(len(labels))
+    colors = ["#1f77b4" if rate >= 50.0 else "#ff7f0e" for rate in tp_rates]
+
+    fig_width = 9.5 if len(labels) <= 16 else min(15.0, 7.5 + len(labels) * 0.35)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+    bars = ax.bar(x, tp_rates, color=colors, alpha=0.85)
+    ax.set_ylim(0, 100)
+    ax.set_title(title or "Entry minute TP reach rate")
+    ax.set_ylabel("TP reach rate (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+
+    for idx, bar in enumerate(bars):
+        height = bar.get_height()
+        total = totals[idx]
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            min(100, height + 2.0),
+            f"{height:.1f}%\nT {total}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#2c2c2c",
+        )
+
+    trades = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_time", trades) or trades)
+    stats_lines = [
+        f"Trades  {trades} (cov {covered})",
+        f"Minutes {stats.get('minutes', 0)}",
+        f"TPRate  {stats.get('tp_rate', 0.0):.1f}%",
+    ]
     ax.text(
         0.01,
         0.98,

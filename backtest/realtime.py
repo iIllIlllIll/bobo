@@ -83,7 +83,7 @@ def _is_reduce_only_not_required(exc: Exception) -> bool:
 
 def _is_filter_error(exc: Exception) -> bool:
     code, msg, body = _extract_binance_error(exc)
-    if code in {-1013, -4016, -1111}:
+    if code in {-1013, -4016, -1111, -4164}:
         return True
     text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
     return (
@@ -560,6 +560,35 @@ class RealtimeRunner:
             return self._dual_side_position
         return None
 
+    async def _resolve_exchange_exit_qty(self, direction: int) -> Optional[float]:
+        if self.binance is None or direction == 0:
+            return None
+        side = "long" if direction > 0 else "short"
+        raw = None
+        if isinstance(self._exchange_positions, dict):
+            raw = self._exchange_positions.get(side, {})
+        try:
+            cached_qty = float(raw.get("qty", 0.0) or 0.0) if isinstance(raw, dict) else 0.0
+        except (TypeError, ValueError):
+            cached_qty = 0.0
+        if cached_qty > 0:
+            return cached_qty
+        try:
+            raw_positions = await asyncio.to_thread(
+                self.binance.get_position_risk, self.symbol
+            )
+        except Exception:
+            return None
+        exchange_positions = self._parse_exchange_positions(raw_positions)
+        self._exchange_positions = exchange_positions
+        self._last_exchange_sync = time.time()
+        raw = exchange_positions.get(side, {})
+        try:
+            qty = float(raw.get("qty", 0.0) or 0.0) if isinstance(raw, dict) else 0.0
+        except (TypeError, ValueError):
+            qty = 0.0
+        return qty if qty > 0 else None
+
     async def _submit_live_order(self, trade: Dict[str, Any]) -> None:
         trade_type = trade.get("type")
         if trade_type not in {"entry", "exit", "exit_partial"}:
@@ -575,6 +604,11 @@ class RealtimeRunner:
         price = float(trade.get("price", 0.0) or 0.0)
         if price <= 0:
             return
+
+        if trade_type in {"exit", "exit_partial"}:
+            exchange_qty = await self._resolve_exchange_exit_qty(direction)
+            if exchange_qty is not None and exchange_qty > 0:
+                qty = exchange_qty
 
         side = "BUY" if direction > 0 else "SELL"
         reduce_only = False
@@ -593,6 +627,9 @@ class RealtimeRunner:
                 )
             except Exception:
                 self._symbol_filters = None
+        min_notional = (
+            self._symbol_filters.min_notional if self._symbol_filters else None
+        )
 
         tick_size = self._symbol_filters.tick_size if self._symbol_filters else 0.0
         step_size = self._symbol_filters.step_size if self._symbol_filters else 0.0
@@ -652,6 +689,20 @@ class RealtimeRunner:
             )
             if adjusted_price <= 0:
                 return
+            if min_notional and not reduce_only_param:
+                rounded_notional = remaining_qty * adjusted_price
+                if rounded_notional < min_notional:
+                    logger.warning(
+                        "Live order blocked: notional must be at least %.6g USDT "
+                        "(current %.6g USDT). symbol=%s side=%s qty=%.8g price=%.8g",
+                        min_notional,
+                        rounded_notional,
+                        self.symbol,
+                        side,
+                        remaining_qty,
+                        adjusted_price,
+                    )
+                    return
 
             try:
                 qty_param = self._format_by_step(remaining_qty, step_size)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from backtest.strategy import Strategy
@@ -40,6 +42,43 @@ def _normalize_pct_list(values: list[float] | None) -> list[float] | None:
     return [_normalize_pct(v) if v is not None else v for v in values]
 
 
+def _normalize_minute_list(value: object | None) -> list[int]:
+    if value is None:
+        return [0, 15, 30, 45]
+    minutes: list[int] = []
+    if isinstance(value, str):
+        for token in re.findall(r"-?\d+", value):
+            try:
+                minutes.append(int(token))
+            except (TypeError, ValueError):
+                continue
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            try:
+                minutes.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    else:
+        try:
+            minutes = [int(value)]
+        except (TypeError, ValueError):
+            minutes = []
+    filtered: list[int] = []
+    for minute in minutes:
+        if 0 <= minute <= 59:
+            filtered.append(minute)
+    if not filtered:
+        return [0, 15, 30, 45]
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for minute in filtered:
+        if minute in seen:
+            continue
+        seen.add(minute)
+        ordered.append(minute)
+    return ordered
+
+
 class CheatkeyStrategy(Strategy):
     NAME = "cheatkey"
 
@@ -54,7 +93,14 @@ class CheatkeyStrategy(Strategy):
         cheatkey_threshold_pct: float = 0.001,
         cheatkey_lookback: int = 6,
         cheatkey_timefilter: bool = True,
+        cheatkey_timefilter_minutes: list[int] | str | None = None,
         cheatkey_diff_lookback: int | None = 1,
+        slowcheat: bool = False,
+        slowcheat_fast_ema: int = 12,
+        slowcheat_slow_ema: int = 26,
+        slowcheat_lookafter: int = 0,
+        slowcheat_timefilter: bool = True,
+        slowcheat_timefilter_minutes: list[int] | str | None = None,
         slope_exit_mode: bool = True,
         slope_exit: bool | None = None,
         slope_exit_lookback: int = 1,
@@ -148,6 +194,8 @@ class CheatkeyStrategy(Strategy):
                     raise ValueError("macro_ema_align_windows must be positive integers")
         if ema_fast >= ema_slow:
             raise ValueError("ema_fast must be less than ema_slow")
+        if slowcheat and slowcheat_fast_ema >= slowcheat_slow_ema:
+            raise ValueError("slowcheat_fast_ema must be less than slowcheat_slow_ema")
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.cheatkey_threshold = cheatkey_threshold
@@ -155,7 +203,14 @@ class CheatkeyStrategy(Strategy):
         self.cheatkey_threshold_pct = _normalize_buffer_pct(cheatkey_threshold_pct) or 0.0
         self.cheatkey_lookback = cheatkey_lookback
         self.cheatkey_timefilter = cheatkey_timefilter
+        self.cheatkey_timefilter_minutes = _normalize_minute_list(cheatkey_timefilter_minutes)
         self.cheatkey_diff_lookback = 1 if cheatkey_diff_lookback is None else cheatkey_diff_lookback
+        self.slowcheat = slowcheat
+        self.slowcheat_fast_ema = slowcheat_fast_ema
+        self.slowcheat_slow_ema = slowcheat_slow_ema
+        self.slowcheat_lookafter = max(int(slowcheat_lookafter), 0)
+        self.slowcheat_timefilter = slowcheat_timefilter
+        self.slowcheat_timefilter_minutes = _normalize_minute_list(slowcheat_timefilter_minutes)
         self.slope_exit_mode = slope_exit_mode if slope_exit is None else slope_exit
         self.slope_exit_lookback = slope_exit_lookback
         self.slope_exit_cooldown_bars = slope_exit_cooldown_bars
@@ -266,6 +321,21 @@ class CheatkeyStrategy(Strategy):
         cross_up = (ema_fast > ema_slow) & (prev_fast <= prev_slow)
         cross_down = (ema_fast < ema_slow) & (prev_fast >= prev_slow)
 
+        slow_fast = _ema(close, self.slowcheat_fast_ema) if self.slowcheat else None
+        slow_slow = _ema(close, self.slowcheat_slow_ema) if self.slowcheat else None
+        slow_prev_fast = slow_fast.shift(1) if slow_fast is not None else None
+        slow_prev_slow = slow_slow.shift(1) if slow_slow is not None else None
+        slow_cross_up = (
+            (slow_fast > slow_slow) & (slow_prev_fast <= slow_prev_slow)
+            if slow_fast is not None and slow_prev_fast is not None and slow_prev_slow is not None
+            else None
+        )
+        slow_cross_down = (
+            (slow_fast < slow_slow) & (slow_prev_fast >= slow_prev_slow)
+            if slow_fast is not None and slow_prev_fast is not None and slow_prev_slow is not None
+            else None
+        )
+
         macro_long = pd.Series(True, index=base_index)
         macro_short = pd.Series(True, index=base_index)
         if self.macro_ema_filter and self.macro_ema_window > 0:
@@ -291,9 +361,14 @@ class CheatkeyStrategy(Strategy):
         macro_long_values = macro_long.to_numpy()
         macro_short_values = macro_short.to_numpy()
         timestamp_values = pd.to_datetime(timestamps).to_numpy()
+        slow_fast_values = slow_fast.to_numpy() if slow_fast is not None else None
+        slow_slow_values = slow_slow.to_numpy() if slow_slow is not None else None
+        slow_cross_up_values = slow_cross_up.to_numpy() if slow_cross_up is not None else None
+        slow_cross_down_values = slow_cross_down.to_numpy() if slow_cross_down is not None else None
 
         lookback_n = max(int(self.cheatkey_lookback), 1)
         diff_lookback_n = max(int(self.cheatkey_diff_lookback or 1), 1)
+        slow_lookafter_n = max(int(self.slowcheat_lookafter), 0)
         ema_dir_min = 0
         if self.ema_dir_filter:
             ema_dir_min = (self.ema_dir_window - 1) + self.ema_dir_lookback
@@ -318,7 +393,7 @@ class CheatkeyStrategy(Strategy):
         def _cheatkey_signal(idx: int, side: str) -> bool:
             if self.cheatkey_timefilter:
                 minute = pd.Timestamp(timestamp_values[idx]).minute
-                if minute not in (0, 15, 30, 45):
+                if minute not in self.cheatkey_timefilter_minutes:
                     return False
             if idx < min_index:
                 return False
@@ -384,21 +459,83 @@ class CheatkeyStrategy(Strategy):
                 threshold = abs(float(close_values[idx])) * float(self.cheatkey_threshold_pct)
             return abs(c12 - c26) <= threshold
 
+        def _slowcheat_signal(idx: int, side: str) -> bool:
+            if not self.slowcheat:
+                return False
+            if self.slowcheat_timefilter:
+                minute = pd.Timestamp(timestamp_values[idx]).minute
+                if minute not in self.slowcheat_timefilter_minutes:
+                    return False
+            if slow_fast_values is None or slow_slow_values is None:
+                return False
+            if slow_cross_up_values is None or slow_cross_down_values is None:
+                return False
+            if not _ema_dir_ok(idx, side):
+                return False
+
+            cross_idx = idx - slow_lookafter_n
+            if cross_idx < 1:
+                return False
+
+            if side == "long":
+                if not slow_cross_up_values[cross_idx]:
+                    return False
+                if pd.isna(slow_fast_values[idx]) or pd.isna(slow_slow_values[idx]):
+                    return False
+                if slow_fast_values[idx] <= slow_slow_values[idx]:
+                    return False
+                if slow_lookafter_n > 0:
+                    # Require the post-cross state to hold for lookafter bars.
+                    for j in range(cross_idx + 1, idx + 1):
+                        if pd.isna(slow_fast_values[j]) or pd.isna(slow_slow_values[j]):
+                            return False
+                        if slow_fast_values[j] <= slow_slow_values[j]:
+                            return False
+                    if slow_cross_down_values[cross_idx + 1 : idx + 1].any():
+                        return False
+            else:
+                if not slow_cross_down_values[cross_idx]:
+                    return False
+                if pd.isna(slow_fast_values[idx]) or pd.isna(slow_slow_values[idx]):
+                    return False
+                if slow_fast_values[idx] >= slow_slow_values[idx]:
+                    return False
+                if slow_lookafter_n > 0:
+                    # Require the post-cross state to hold for lookafter bars.
+                    for j in range(cross_idx + 1, idx + 1):
+                        if pd.isna(slow_fast_values[j]) or pd.isna(slow_slow_values[j]):
+                            return False
+                        if slow_fast_values[j] >= slow_slow_values[j]:
+                            return False
+                    if slow_cross_up_values[cross_idx + 1 : idx + 1].any():
+                        return False
+            return True
+
         raw_long = pd.Series(False, index=base_index, dtype=bool)
         raw_short = pd.Series(False, index=base_index, dtype=bool)
         for idx in range(len(base_index)):
-            if _cheatkey_signal(idx, "long") and macro_long_values[idx]:
-                raw_long.iat[idx] = True
-            if _cheatkey_signal(idx, "short") and macro_short_values[idx]:
-                raw_short.iat[idx] = True
+            if self.slowcheat:
+                if _slowcheat_signal(idx, "long") and macro_long_values[idx]:
+                    raw_long.iat[idx] = True
+                if _slowcheat_signal(idx, "short") and macro_short_values[idx]:
+                    raw_short.iat[idx] = True
+            else:
+                if _cheatkey_signal(idx, "long") and macro_long_values[idx]:
+                    raw_long.iat[idx] = True
+                if _cheatkey_signal(idx, "short") and macro_short_values[idx]:
+                    raw_short.iat[idx] = True
 
         signals = pd.Series(0, index=base_index, dtype=int)
         signals[raw_long] = 1
         signals[raw_short] = -1
 
         reasons = pd.Series("", index=base_index, dtype=object)
-        reasons[raw_long] = "cheatkey_long_expected"
-        reasons[raw_short] = "cheatkey_short_expected"
+        if self.slowcheat:
+            reasons[raw_long] = "slowcheat_long_cross"
+            reasons[raw_short] = "slowcheat_short_cross"
+        else:
+            reasons[raw_long] = "cheatkey_long_expected"
+            reasons[raw_short] = "cheatkey_short_expected"
 
         return signals.reindex(data.index).fillna(0), reasons.reindex(data.index).fillna("")
 
