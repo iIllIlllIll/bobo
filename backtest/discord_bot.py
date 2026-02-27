@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 from backtest.binance import BinanceAPIError, BinanceFuturesClient, BinanceSpotClient
 from backtest.config import Settings, save_settings, load_settings
-from backtest.analysis import EntryDiffConfig
+from backtest.analysis import EntryDiffConfig, build_entry_feature_frame
 from backtest.runner import (
     _normalize_cheatkey_params,
     create_settings_snapshot,
@@ -37,22 +37,33 @@ from backtest.runner import (
     run_backtest_summary,
 )
 from backtest.data import download_price_data
-from backtest.realtime import RealtimeRunner, RunnerPayload
-from backtest.strategy_loader import list_strategy_names
+from backtest.realtime import RealtimeRunner, RunnerPayload, LiveOrderResult
+from backtest.strategy_loader import get_strategy_class, list_strategy_names
 from backtest.plot import (
     create_costom_loss_chart,
     create_equity_overlay_monthly_best_chart,
     create_equity_mdd_monthly_stats_chart,
     create_equity_price_chart,
+    create_entry_hour_exit_reason_chart,
+    create_entry_hour_exit_reason_group_chart,
     create_monthly_return_stability_chart,
     create_equity_price_mdd_chart,
     create_entry_minute_win_rate_chart,
     create_entry_minute_tp_rate_chart,
+    create_tp_target_win_rate_chart,
+    create_exit_reason_entry_feature_mean_chart,
+    create_sl_target_win_rate_chart,
+    create_tp_sl_target_win_rate_chart,
     create_grid_heatmap,
     create_trade_pnl_curve,
+    create_trade_lookback_extreme_chart,
     create_trade_snapshot_chart,
+    compute_entry_hour_exit_reason_distribution,
     compute_entry_minute_win_rate,
     compute_entry_minute_tp_rate,
+    compute_tp_hit_rate,
+    compute_tp_target_win_rate,
+    compute_sl_target_win_rate,
     compute_monthly_return_stats,
 )
 
@@ -138,6 +149,7 @@ class LiveOrderDraft:
     qty: float
     reduce_only: bool
     maker_offset_bps: float
+    maker_aggressive_ticks: int
 
 
 @dataclass
@@ -148,6 +160,7 @@ class ClosePositionDraft:
     qty: float
     price: float
     maker_offset_bps: float
+    maker_aggressive_ticks: int
 
 
 WORDLE_WORDS = (
@@ -410,11 +423,58 @@ class SettingApplySelect(Select):
             )
             return
         name = self.values[0]
-        ok, message = await self.bot._apply_setting_profile(name)
-        await interaction.response.send_message(
-            message,
-            ephemeral=not ok,
+        view = self.view
+        if not isinstance(view, SettingApplyView):
+            ok, message = await self.bot._apply_setting_profile(name)
+            try:
+                await interaction.response.send_message(message, ephemeral=not ok)
+            except (discord.NotFound, discord.errors.NotFound):
+                if interaction.channel:
+                    await interaction.channel.send(message)
+            return
+        view.selected_profile = name
+        view._set_apply_enabled(True)
+        try:
+            await interaction.response.edit_message(
+                content=f"Selected profile: `{name}`. Click Apply or Cancel.",
+                view=view,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send(
+                    "This apply interaction expired. Run `!setting apply` again.",
+                )
+
+
+class SettingLookSelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.requester_id = requester_id
+        options: List[discord.SelectOption] = []
+        for name in profiles:
+            label = bot._format_setting_profile_label(name)
+            options.append(discord.SelectOption(label=label[:100], value=name))
+        super().__init__(
+            placeholder="Select a profile to preview",
+            min_values=1,
+            max_values=1,
+            options=options,
         )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested look can use this.",
+                ephemeral=True,
+            )
+            return
+        name = self.values[0]
+        await self.bot._send_setting_profile_preview(interaction, name)
 
 
 class LiveOrderModal(Modal):
@@ -517,7 +577,83 @@ class SettingApplyView(View):
         self.bot = bot
         self.requester_id = requester_id
         self.message: Optional[discord.Message] = None
+        self.selected_profile: Optional[str] = None
         self.add_item(SettingApplySelect(bot, profiles, requester_id))
+        self._set_apply_enabled(False)
+
+    def _set_apply_enabled(self, enabled: bool) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.custom_id == "setting_apply":
+                item.disabled = not enabled
+                break
+
+    @discord.ui.button(
+        label="Apply",
+        style=discord.ButtonStyle.primary,
+        custom_id="setting_apply",
+    )
+    async def apply_profile(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        if not self.selected_profile:
+            await interaction.response.send_message(
+                "Select a profile first.",
+                ephemeral=True,
+            )
+            return
+        name = self.selected_profile
+        try:
+            await interaction.response.defer()
+        except (discord.NotFound, discord.errors.NotFound, discord.InteractionResponded):
+            pass
+        ok, message = await self.bot._apply_setting_profile(name)
+        self._set_apply_enabled(False)
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.edit_original_response(content=message, view=self)
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send(message)
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="setting_apply_cancel",
+    )
+    async def cancel_apply(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        try:
+            try:
+                await interaction.response.defer()
+            except (discord.NotFound, discord.errors.NotFound, discord.InteractionResponded):
+                pass
+            await interaction.edit_original_response(
+                content="Apply canceled.",
+                view=self,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send("Apply canceled.")
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -525,6 +661,447 @@ class SettingApplyView(View):
         if self.message:
             await self.message.edit(view=self)
 
+
+class SettingLookView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.add_item(SettingLookSelect(bot, profiles, requester_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class RealtimeSettingSaveModal(Modal):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        requester_id: int,
+    ) -> None:
+        title = f"Save {group.upper()} Settings"
+        super().__init__(title=title)
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        self.name_input = TextInput(
+            label="Profile name",
+            required=True,
+            max_length=50,
+        )
+        self.description_input = TextInput(
+            label="Description (optional)",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.name_input)
+        self.add_item(self.description_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the save can submit.",
+                ephemeral=True,
+            )
+            return
+        name = self.name_input.value.strip()
+        description = self.description_input.value.strip()
+        path, err = self.bot._save_realtime_setting_profile(
+            self.group,
+            name,
+            description=description or None,
+            overwrite=False,
+        )
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Saved current {self.group} settings to `{path.name}`.",
+            ephemeral=True,
+        )
+
+
+class RealtimeSettingOverwriteSelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        options = [
+            discord.SelectOption(label=name[:100], value=name) for name in profiles
+        ]
+        super().__init__(
+            placeholder="Select a profile to overwrite",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the save can overwrite.",
+                ephemeral=True,
+            )
+            return
+        name = self.values[0]
+        path, err = self.bot._save_realtime_setting_profile(
+            self.group,
+            name,
+            description=None,
+            overwrite=True,
+        )
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Overwrote `{path.name}` with current {self.group} settings.",
+            ephemeral=True,
+        )
+
+
+class RealtimeSettingApplySelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        options: List[discord.SelectOption] = []
+        for name in profiles:
+            label = bot._format_realtime_setting_profile_label(group, name)
+            options.append(discord.SelectOption(label=label[:100], value=name))
+        super().__init__(
+            placeholder="Select a profile to apply",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        name = self.values[0]
+        view = self.view
+        if not isinstance(view, RealtimeSettingApplyView):
+            ok, message = await self.bot._apply_realtime_setting_profile(
+                self.group, name
+            )
+            try:
+                await interaction.response.send_message(message, ephemeral=not ok)
+            except (discord.NotFound, discord.errors.NotFound):
+                if interaction.channel:
+                    await interaction.channel.send(message)
+            return
+        view.selected_profile = name
+        view._set_apply_enabled(True)
+        try:
+            await interaction.response.edit_message(
+                content=f"Selected profile: `{name}`. Click Apply or Cancel.",
+                view=view,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send(
+                    f"This apply interaction expired. Run `!{self.group} setting apply` again.",
+                )
+
+
+class RealtimeSettingLookSelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        options: List[discord.SelectOption] = []
+        for name in profiles:
+            label = bot._format_realtime_setting_profile_label(group, name)
+            options.append(discord.SelectOption(label=label[:100], value=name))
+        super().__init__(
+            placeholder="Select a profile to preview",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested look can use this.",
+                ephemeral=True,
+            )
+            return
+        name = self.values[0]
+        await self.bot._send_realtime_setting_profile_preview(
+            interaction, self.group, name
+        )
+
+
+class RealtimeSettingOverwriteView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.add_item(
+            RealtimeSettingOverwriteSelect(bot, group, profiles, requester_id)
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class RealtimeSettingApplyView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.selected_profile: Optional[str] = None
+        self.add_item(RealtimeSettingApplySelect(bot, group, profiles, requester_id))
+        self._set_apply_enabled(False)
+
+    def _set_apply_enabled(self, enabled: bool) -> None:
+        for item in self.children:
+            if (
+                isinstance(item, discord.ui.Button)
+                and item.custom_id == "realtime_setting_apply"
+            ):
+                item.disabled = not enabled
+                break
+
+    @discord.ui.button(
+        label="Apply",
+        style=discord.ButtonStyle.primary,
+        custom_id="realtime_setting_apply",
+    )
+    async def apply_profile(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        if not self.selected_profile:
+            await interaction.response.send_message(
+                "Select a profile first.",
+                ephemeral=True,
+            )
+            return
+        name = self.selected_profile
+        try:
+            await interaction.response.defer()
+        except (discord.NotFound, discord.errors.NotFound, discord.InteractionResponded):
+            pass
+        ok, message = await self.bot._apply_realtime_setting_profile(
+            self.group, name
+        )
+        self._set_apply_enabled(False)
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.edit_original_response(content=message, view=self)
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send(message)
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="realtime_setting_apply_cancel",
+    )
+    async def cancel_apply(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested apply can use this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        try:
+            try:
+                await interaction.response.defer()
+            except (discord.NotFound, discord.errors.NotFound, discord.InteractionResponded):
+                pass
+            await interaction.edit_original_response(
+                content="Apply canceled.",
+                view=self,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send("Apply canceled.")
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class RealtimeSettingLookView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        profiles: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+        self.add_item(RealtimeSettingLookSelect(bot, group, profiles, requester_id))
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class RealtimeSettingSaveChoiceView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        group: str,
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.group = group
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+
+    async def _reject_if_not_owner(
+        self, interaction: discord.Interaction
+    ) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the save can use these buttons.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Save New", style=discord.ButtonStyle.primary)
+    async def save_new(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not await self._reject_if_not_owner(interaction):
+            return
+        await interaction.response.send_modal(
+            RealtimeSettingSaveModal(self.bot, self.group, self.requester_id)
+        )
+
+    @discord.ui.button(label="Overwrite Existing", style=discord.ButtonStyle.secondary)
+    async def overwrite(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not await self._reject_if_not_owner(interaction):
+            return
+        profiles = self.bot._list_realtime_setting_profiles(self.group)
+        if not profiles:
+            await interaction.response.send_message(
+                "No saved profiles to overwrite.", ephemeral=True
+            )
+            return
+        view = RealtimeSettingOverwriteView(
+            self.bot, self.group, profiles, self.requester_id
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"Select a profile to overwrite with the current {self.group} settings.",
+                view=view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"Select a profile to overwrite with the current {self.group} settings.",
+                view=view,
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not await self._reject_if_not_owner(interaction):
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
 
 class LiveOrderStartView(View):
     def __init__(
@@ -3475,6 +4052,7 @@ class BacktestBot(commands.Bot):
         )
         self.settings = settings
         self.settings_path = settings_path
+        self._ensure_strategy_param_defaults()
         self.command_channel_name = discord_cfg.get("command_channel", "backtest-commands")
         self.result_channel_name = discord_cfg.get("result_channel", "backtest-results")
         self.data_list_channel_name = discord_cfg.get("data_list_channel", "backtest-data")
@@ -3494,6 +4072,7 @@ class BacktestBot(commands.Bot):
         self.live_status_channel_name = discord_cfg.get("live_status_channel", "live-status")
         self.live_result_channel_name = discord_cfg.get("live_result_channel", "live-results")
         self.live_tradelog_channel_name = discord_cfg.get("live_tradelog_channel", "live-tradelog")
+        self.live_log_channel_name = discord_cfg.get("live_log_channel", "live-log")
         self.sim_channel_names = list(discord_cfg.get("sim_channels", []))
         self.live_channel_names = list(discord_cfg.get("live_channels", []))
         self.backtest_channel_names = [
@@ -3532,6 +4111,7 @@ class BacktestBot(commands.Bot):
             self.live_status_channel_name,
             self.live_result_channel_name,
             self.live_tradelog_channel_name,
+            self.live_log_channel_name,
         ):
             if name and name not in self.live_channel_names:
                 self.live_channel_names.append(name)
@@ -3540,6 +4120,12 @@ class BacktestBot(commands.Bot):
         self.guild_id = discord_cfg.get("guild_id")
         self.setting_profiles_dir = Path(
             discord_cfg.get("setting_profiles_dir", "config/setting_profiles")
+        )
+        self.sim_setting_profiles_dir = Path(
+            discord_cfg.get("sim_setting_profiles_dir", "config/sim_setting_profiles")
+        )
+        self.live_setting_profiles_dir = Path(
+            discord_cfg.get("live_setting_profiles_dir", "config/live_setting_profiles")
         )
         self.status_sources = dict(discord_cfg.get("status_sources", {}))
         self.status_interval_minutes = int(
@@ -3586,6 +4172,7 @@ class BacktestBot(commands.Bot):
             commands.Command(download_text_command, name="download"),
             commands.Command(delete_data_text_command, name="delete_data"),
             commands.Command(backtest_text_command, name="testrun"),
+            commands.Command(recent_text_command, name="recent"),
             commands.Command(entry_diff_text_command, name="diff"),
             commands.Command(grid_text_command, name="grid"),
             commands.Command(comp_text_command, name="comp"),
@@ -3603,6 +4190,9 @@ class BacktestBot(commands.Bot):
             commands.Command(setting_text_command, name="setting"),
             commands.Command(sim_text_command, name="sim"),
             commands.Command(live_text_command, name="live"),
+            commands.Command(livetest_text_command, name="livetest"),
+            commands.Command(closetest_text_command, name="closetest"),
+            commands.Command(closetest_text_command, name="livetestclose"),
             commands.Command(order_text_command, name="order"),
             commands.Command(close_text_command, name="close"),
             commands.Command(positions_text_command, name="positions"),
@@ -3631,6 +4221,111 @@ class BacktestBot(commands.Bot):
         required_notional = qty * price
         required_margin = required_notional / leverage if leverage > 0 else required_notional
         return qty, required_notional, required_margin
+
+    @staticmethod
+    def _calc_margin_usdt(price: float, qty: float, leverage: float) -> float:
+        notional = abs(price * qty)
+        if leverage and leverage > 0:
+            return notional / leverage
+        return notional
+
+    @staticmethod
+    def _calc_trade_pnl_return(
+        entry_price: float,
+        exit_price: float,
+        qty: float,
+        direction: int,
+        leverage: float,
+    ) -> tuple[float, float]:
+        if entry_price <= 0 or exit_price <= 0 or qty <= 0 or direction == 0:
+            return 0.0, 0.0
+        pnl = (exit_price - entry_price) * qty * direction
+        notional = abs(entry_price * qty)
+        ret = (pnl / notional) * leverage if notional > 0 else 0.0
+        return pnl, ret
+
+    def _enrich_exit_trade_metrics(
+        self,
+        trade: Dict[str, Any],
+        data: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        trade_type = str(trade.get("type", "")).lower()
+        if trade_type not in {"exit", "exit_partial"}:
+            return trade
+        direction = int(trade.get("direction", 0) or 0)
+        if direction == 0:
+            return trade
+        entry_price = float(trade.get("entry_price", trade.get("price", 0.0)) or 0.0)
+        exit_price = float(trade.get("price", 0.0) or 0.0)
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        leverage = float(trade.get("leverage", 1.0) or 1.0)
+        if leverage <= 0:
+            leverage = 1.0
+
+        computed_pnl, computed_ret = self._calc_trade_pnl_return(
+            entry_price, exit_price, qty, direction, leverage
+        )
+        pnl = trade.get("pnl")
+        if pnl is None:
+            trade["pnl"] = computed_pnl
+        else:
+            try:
+                pnl_val = float(pnl)
+            except (TypeError, ValueError):
+                pnl_val = 0.0
+            if pnl_val == 0.0 and abs(exit_price - entry_price) > 0 and qty > 0:
+                trade["pnl"] = computed_pnl
+
+        ret = trade.get("return")
+        if ret is None:
+            trade["return"] = computed_ret
+        else:
+            try:
+                ret_val = float(ret)
+            except (TypeError, ValueError):
+                ret_val = 0.0
+            if ret_val == 0.0 and abs(exit_price - entry_price) > 0 and qty > 0:
+                trade["return"] = computed_ret
+
+        min_ret = trade.get("min_return")
+        max_ret = trade.get("max_return")
+        need_min_max = min_ret is None or max_ret is None
+        if not need_min_max:
+            try:
+                min_val = float(min_ret)
+                max_val = float(max_ret)
+            except (TypeError, ValueError):
+                min_val = 0.0
+                max_val = 0.0
+            if min_val == 0.0 and max_val == 0.0 and abs(exit_price - entry_price) > 0:
+                need_min_max = True
+
+        if need_min_max and entry_price > 0 and not data.empty:
+            if {"high", "low"}.issubset(data.columns):
+                entry_idx = self._resolve_trade_index(
+                    data, trade.get("entry_time") or trade.get("timestamp")
+                )
+                exit_idx = self._resolve_trade_index(
+                    data, trade.get("exit_time") or trade.get("timestamp")
+                )
+                if entry_idx is not None and exit_idx is not None:
+                    start = min(entry_idx, exit_idx)
+                    end = max(entry_idx, exit_idx) + 1
+                    window = data.iloc[start:end]
+                else:
+                    window = data.tail(1)
+                highs = pd.to_numeric(window["high"], errors="coerce")
+                lows = pd.to_numeric(window["low"], errors="coerce")
+                if not highs.isna().all() and not lows.isna().all():
+                    ret_high = ((highs - entry_price) / entry_price) * direction * leverage
+                    ret_low = ((lows - entry_price) / entry_price) * direction * leverage
+                    combined_min = float(np.nanmin([ret_high.min(), ret_low.min()]))
+                    combined_max = float(np.nanmax([ret_high.max(), ret_low.max()]))
+                    if min_ret is None or need_min_max:
+                        trade["min_return"] = combined_min
+                    if max_ret is None or need_min_max:
+                        trade["max_return"] = combined_max
+        return trade
 
     @staticmethod
     def _split_message(message: str, limit: int = 2000) -> List[str]:
@@ -3958,6 +4653,15 @@ class BacktestBot(commands.Bot):
         if group == "live":
             return self.live_runner
         return None
+
+    def _ensure_live_runner_for_test(self) -> Optional[RealtimeRunner]:
+        if self.live_runner is not None:
+            return self.live_runner
+        runner = self._build_realtime_runner("live")
+        if runner is None:
+            return None
+        self.live_runner = runner
+        return runner
 
     def _payload_to_snapshot(self, payload: RunnerPayload) -> Optional[StatusSnapshot]:
         if payload is None:
@@ -4314,6 +5018,20 @@ class BacktestBot(commands.Bot):
             text = text.rstrip("0").rstrip(".")
         return text
 
+    def _fmt_target_with_pct(
+        self,
+        entry_price: float,
+        target_price: Any,
+        direction: int,
+        leverage: float,
+    ) -> str:
+        if target_price is None:
+            return "n/a"
+        pct = self._resolve_target_pnl(entry_price, target_price, direction, leverage, None)
+        if pct is None:
+            return self._fmt_price(target_price)
+        return f"{self._fmt_price(target_price)} ({pct:+.2f}%)"
+
     def _format_status_embed(
         self, snapshot: StatusSnapshot, title: str, group: str
     ) -> discord.Embed:
@@ -4369,13 +5087,20 @@ class BacktestBot(commands.Bot):
             initial_balance = self._sim_initial_balance()
             roi_text = fmt_roi(initial_balance, snapshot.equity)
             asset_value = (
-                f"설정 {fmt_money(initial_balance)}\n"
+                f"원금 {fmt_money(initial_balance)}\n"
                 f"초기자산 대비 {roi_text}\n"
                 f"총 {fmt_money(snapshot.equity)}\n"
                 f"가용 {fmt_money(snapshot.free_balance)}"
             )
         else:
+            initial_balance = self._live_initial_balance()
+            initial_text = (
+                f"원금 {fmt_money(initial_balance)}\n"
+                if initial_balance > 0
+                else "원금 n/a\n"
+            )
             asset_value = (
+                f"{initial_text}"
                 f"총 {fmt_money(snapshot.equity)}\n"
                 f"가용 {fmt_money(snapshot.free_balance)}"
             )
@@ -4474,30 +5199,27 @@ class BacktestBot(commands.Bot):
             except (TypeError, ValueError):
                 return default
 
+        bt_cfg = cfg.get("backtest") if isinstance(cfg.get("backtest"), dict) else None
+        strategy_cfg = cfg.get("strategy") if isinstance(cfg.get("strategy"), dict) else None
+
+        def _bt_value(key: str, default: Any = None) -> Any:
+            if key in cfg:
+                return cfg.get(key)
+            if bt_cfg is not None and key in bt_cfg:
+                return bt_cfg.get(key)
+            return self.settings.backtest.get(key, default)
+
         symbol = str(cfg.get("symbol", "XRPUSDT")).upper()
         interval = str(cfg.get("interval", "5m"))
-        initial_balance = _as_float(
-            cfg.get("initial_balance", self.settings.backtest.get("initial_balance")), 0.0
-        )
-        fee_rate = _as_float(
-            cfg.get("fee_rate", self.settings.backtest.get("fee_rate")), 0.0
-        )
-        leverage = _as_float(
-            cfg.get("leverage", self.settings.backtest.get("leverage")), 1.0
-        )
-        position_size = _as_float(
-            cfg.get("position_size", self.settings.backtest.get("position_size")), 1.0
-        )
-        slippage = _as_float(
-            cfg.get("slippage", self.settings.backtest.get("slippage")), 0.0
-        )
-        risk_per_trade = cfg.get("risk_per_trade", self.settings.backtest.get("risk_per_trade"))
+        initial_balance = _as_float(_bt_value("initial_balance"), 0.0)
+        fee_rate = _as_float(_bt_value("fee_rate"), 0.0)
+        leverage = _as_float(_bt_value("leverage"), 1.0)
+        position_size = _as_float(_bt_value("position_size"), 1.0)
+        slippage = _as_float(_bt_value("slippage"), 0.0)
+        risk_per_trade = _bt_value("risk_per_trade")
         if risk_per_trade is not None:
             risk_per_trade = _as_float(risk_per_trade, 0.0)
-        max_pos_fraction = cfg.get(
-            "max_position_fraction_per_side",
-            self.settings.backtest.get("max_position_fraction_per_side"),
-        )
+        max_pos_fraction = _bt_value("max_position_fraction_per_side")
         if max_pos_fraction is not None:
             max_pos_fraction = _as_float(max_pos_fraction, 0.0)
         poll_interval = _as_float(cfg.get("poll_interval", 10.0), 10.0)
@@ -4507,14 +5229,31 @@ class BacktestBot(commands.Bot):
         if max_history is not None:
             max_history = _as_int(max_history, 0)
         maker_offset_bps = _as_float(cfg.get("maker_offset_bps", 1.0), 1.0)
+        maker_aggressive_ticks = _as_int(cfg.get("maker_aggressive_ticks", 0), 0)
         auto_trade = bool(cfg.get("auto_trade", False))
+        if group != "live":
+            if auto_trade:
+                logger.warning("Ignoring auto_trade for %s runner; sim never places live orders.", group)
+            auto_trade = False
+        else:
+            # Live runner always trades when running; config only gates start.
+            auto_trade = True
         sync_exchange_positions = bool(cfg.get("sync_exchange_positions", group == "live"))
         sync_interval_seconds = _as_float(cfg.get("sync_interval_seconds", 10.0), 10.0)
         sync_history_path = cfg.get("sync_history_path")
-        live_order_retry_seconds = _as_float(cfg.get("live_order_retry_seconds", 30.0), 30.0)
+        live_order_retry_seconds = _as_float(cfg.get("live_order_retry_seconds", 20.0), 20.0)
+        live_order_retry_max_seconds = _as_float(
+            cfg.get("live_order_retry_max_seconds", 180.0), 180.0
+        )
         live_order_max_attempts = _as_int(cfg.get("live_order_max_attempts", 0), 0)
         if sync_history_path is None and group == "live":
             sync_history_path = "backtest/live_position_sync.jsonl"
+        state_path = cfg.get("state_path")
+        if state_path is None and group == "sim":
+            state_path = "backtest/sim_state.json"
+        elif state_path is None and group == "live":
+            state_path = "backtest/live_state.json"
+        persist_seen_limit = _as_int(cfg.get("persist_seen_limit", 2000), 2000)
 
         api_key = str(cfg.get("api_key", "") or "")
         api_secret = str(cfg.get("api_secret", "") or "")
@@ -4542,6 +5281,33 @@ class BacktestBot(commands.Bot):
                 ).lower()
                 return "no need to change margin type" in text or "already" in text
 
+            def _resolve_position_risk() -> tuple[bool, Optional[float]]:
+                try:
+                    payload = binance.get_position_risk(symbol)
+                except Exception:
+                    return False, None
+                entries: list[dict[str, Any]] = []
+                if isinstance(payload, list):
+                    entries = [item for item in payload if isinstance(item, dict)]
+                elif isinstance(payload, dict):
+                    entries = [payload]
+                has_position = False
+                leverage_value: Optional[float] = None
+                for entry in entries:
+                    try:
+                        amt = float(entry.get("positionAmt", 0.0))
+                    except Exception:
+                        amt = 0.0
+                    if abs(amt) > 0:
+                        has_position = True
+                    try:
+                        lev = float(entry.get("leverage", 0.0))
+                    except Exception:
+                        lev = 0.0
+                    if lev > 0 and (leverage_value is None or lev > leverage_value):
+                        leverage_value = lev
+                return has_position, leverage_value
+
             try:
                 binance.set_position_mode(True)
                 dual_side_position = True
@@ -4562,10 +5328,28 @@ class BacktestBot(commands.Bot):
                         self._format_binance_error(exc),
                     )
             if leverage:
-                try:
-                    binance.set_leverage(symbol, int(leverage))
-                except Exception:
+                desired_leverage = int(leverage)
+                has_position, current_leverage = _resolve_position_risk()
+                if current_leverage is not None and desired_leverage == int(current_leverage):
                     pass
+                elif has_position and current_leverage is not None and desired_leverage < current_leverage:
+                    logger.info(
+                        "Skip leverage reduction in isolated mode with open position: "
+                        "symbol=%s current=%s desired=%s",
+                        symbol,
+                        current_leverage,
+                        desired_leverage,
+                    )
+                else:
+                    try:
+                        binance.set_leverage(symbol, desired_leverage)
+                    except Exception as exc:
+                        logger.warning(
+                            "Live leverage setup failed: symbol=%s leverage=%s error=%s",
+                            symbol,
+                            desired_leverage,
+                            self._format_binance_error(exc) or str(exc),
+                        )
             try:
                 payload = binance.get_position_mode()
                 if isinstance(payload, dict):
@@ -4574,8 +5358,27 @@ class BacktestBot(commands.Bot):
                 pass
 
         strategy_name = "cheatkey"
-        strategy_params = {}
-        if isinstance(self.settings.strategy, dict):
+        strategy_params: Dict[str, Any] = {}
+        strategy_override = cfg.get("strategy_name")
+        if isinstance(strategy_override, str) and strategy_override:
+            strategy_name = strategy_override
+        elif strategy_cfg is not None:
+            settings_name = strategy_cfg.get("name")
+            if isinstance(settings_name, str) and settings_name:
+                strategy_name = settings_name
+        elif isinstance(self.settings.strategy, dict):
+            settings_name = self.settings.strategy.get("name")
+            if isinstance(settings_name, str) and settings_name:
+                strategy_name = settings_name
+
+        raw_params = cfg.get("strategy_params")
+        if isinstance(raw_params, dict):
+            strategy_params = dict(raw_params)
+        elif strategy_cfg is not None:
+            raw_params = strategy_cfg.get("params", {})
+            if isinstance(raw_params, dict):
+                strategy_params = dict(raw_params)
+        elif isinstance(self.settings.strategy, dict):
             raw_params = self.settings.strategy.get("params", {})
             if isinstance(raw_params, dict):
                 strategy_params = dict(raw_params)
@@ -4585,6 +5388,9 @@ class BacktestBot(commands.Bot):
 
         def on_payload(group_name: str, payload: RunnerPayload) -> None:
             self._realtime_payloads[group_name] = payload
+
+        def on_order(group_name: str, trade: Dict[str, Any], result: LiveOrderResult) -> None:
+            asyncio.create_task(self._handle_realtime_order(group_name, trade, result))
 
         return RealtimeRunner(
             group=group,
@@ -4605,15 +5411,20 @@ class BacktestBot(commands.Bot):
             max_history=max_history,
             binance=binance,
             maker_offset_bps=maker_offset_bps,
+            maker_aggressive_ticks=maker_aggressive_ticks,
             auto_trade=auto_trade,
             sync_exchange_positions=sync_exchange_positions,
             sync_interval_seconds=sync_interval_seconds,
             sync_history_path=sync_history_path,
             live_order_retry_seconds=live_order_retry_seconds,
+            live_order_retry_max_seconds=live_order_retry_max_seconds,
             live_order_max_attempts=live_order_max_attempts,
             dual_side_position=dual_side_position,
+            state_path=state_path,
+            persist_seen_limit=persist_seen_limit,
             on_trade=on_trade,
             on_payload=on_payload,
+            on_order=on_order,
         )
 
     async def _handle_realtime_trade(
@@ -4625,11 +5436,155 @@ class BacktestBot(commands.Bot):
         trade_type = str(trade.get("type", "")).lower()
         if trade_type not in {"entry", "add", "exit", "exit_partial"}:
             return
+        if trade_type in {"exit", "exit_partial"}:
+            self._enrich_exit_trade_metrics(trade, data)
         await self._send_trade_log(group, trade)
         if trade_type == "exit":
             await self._send_trade_result(group, trade, data)
 
+    async def _handle_realtime_order(
+        self,
+        group: str,
+        trade: Dict[str, Any],
+        result: LiveOrderResult,
+    ) -> None:
+        if group != "live":
+            return
+        await self._send_live_order_log(trade, result)
+        if result.success:
+            return
+        channel = await self._get_or_create_group_channel(
+            group, self._group_channel_name(group, "status")
+        )
+        if channel is None:
+            return
+        direction = int(trade.get("direction", 0) or 0)
+        side = "롱" if direction > 0 else "숏"
+        emoji = "🟠" if result.status in {"submitted", "not_filled"} else "🔴"
+        color = discord.Color.orange() if result.status in {"submitted", "not_filled"} else discord.Color.red()
+        trade_type = str(trade.get("type", "")).lower()
+        action = {
+            "entry": "진입",
+            "add": "추가매수",
+            "exit": "청산",
+            "exit_partial": "부분청산",
+        }.get(trade_type, trade_type)
+        price = float(trade.get("price", 0.0) or 0.0)
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        leverage = float(trade.get("leverage", 1.0) or 1.0)
+        notional = abs(price * qty)
+        margin_usdt = self._calc_margin_usdt(price, qty, leverage)
+        order_id = f"{result.order_id}" if result.order_id is not None else "n/a"
+        status = (result.status or "error").upper()
+        detail = result.detail or "n/a"
+        symbol = "UNKNOWN"
+        runner = self._runner_for_group(group)
+        if runner is not None:
+            symbol = runner.symbol
+
+        embed = discord.Embed(
+            title=f"{emoji} LIVE 주문 실패/미체결",
+            color=color,
+        )
+        embed.add_field(
+            name="거래",
+            value=f"{symbol} {side} {action} | {status}",
+            inline=False,
+        )
+        embed.add_field(
+            name="가격/수량/레버리지",
+            value=(
+                f"가격: {self._fmt_price(price)}\n"
+                f"수량: {qty:.6g}\n"
+                f"레버리지: {leverage:.2f}x\n"
+                f"레버리지 적용 금액(USDT): {notional:,.2f}\n"
+                f"투입 원금(USDT): {margin_usdt:,.2f}"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="주문",
+            value=f"order_id: {order_id}\n상세: {detail}",
+            inline=False,
+        )
+        embed.set_footer(text="자동매매 주문이 체결되지 않아 트레이드 로그는 기록되지 않았습니다.")
+        await channel.send(embed=embed)
+
+    async def _send_live_order_log(
+        self,
+        trade: Dict[str, Any],
+        result: LiveOrderResult,
+    ) -> None:
+        channel = await self._get_or_create_group_channel("live", self.live_log_channel_name)
+        if channel is None:
+            return
+        direction = int(trade.get("direction", 0) or 0)
+        side = "롱" if direction > 0 else "숏"
+        trade_type = str(trade.get("type", "")).lower()
+        action = {
+            "entry": "진입",
+            "add": "추가매수",
+            "exit": "청산",
+            "exit_partial": "부분청산",
+        }.get(trade_type, trade_type)
+        price = float(trade.get("price", 0.0) or 0.0)
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        leverage = float(trade.get("leverage", 1.0) or 1.0)
+        notional = abs(price * qty)
+        margin_usdt = self._calc_margin_usdt(price, qty, leverage)
+        order_id = f"{result.order_id}" if result.order_id is not None else "n/a"
+        status = (result.status or "unknown").upper()
+        detail = result.detail or "n/a"
+        attempts = int(result.attempts or 0)
+        elapsed = float(result.elapsed_seconds or 0.0)
+        if result.success:
+            emoji = "🟢"
+            color = discord.Color.green()
+        elif result.status in {"submitted", "not_filled", "blocked"}:
+            emoji = "🟠"
+            color = discord.Color.orange()
+        else:
+            emoji = "🔴"
+            color = discord.Color.red()
+        symbol = "UNKNOWN"
+        runner = self._runner_for_group("live")
+        if runner is not None:
+            symbol = runner.symbol
+
+        embed = discord.Embed(
+            title=f"{emoji} LIVE 주문 로그",
+            color=color,
+        )
+        embed.add_field(
+            name="거래",
+            value=f"{symbol} {side} {action} | {status}",
+            inline=False,
+        )
+        embed.add_field(
+            name="가격/수량/레버리지",
+            value=(
+                f"가격: {self._fmt_price(price)}\n"
+                f"수량: {qty:.6g}\n"
+                f"레버리지: {leverage:.2f}x\n"
+                f"레버리지 적용 금액(USDT): {notional:,.2f}\n"
+                f"투입 원금(USDT): {margin_usdt:,.2f}"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="주문 상태",
+            value=(
+                f"order_id: {order_id}\n"
+                f"attempts: {attempts}\n"
+                f"elapsed: {elapsed:.2f}s\n"
+                f"상세: {detail}"
+            ),
+            inline=False,
+        )
+        await channel.send(embed=embed)
+
     async def _send_trade_log(self, group: str, trade: Dict[str, Any]) -> None:
+        await self._append_trade_log(group, trade)
         channel = await self._get_or_create_group_channel(
             group, self._group_channel_name(group, "tradelog")
         )
@@ -4649,10 +5604,21 @@ class BacktestBot(commands.Bot):
         price = float(trade.get("price", 0.0) or 0.0)
         qty = float(trade.get("qty", 0.0) or 0.0)
         leverage = float(trade.get("leverage", 1.0) or 1.0)
+        entry_price = float(trade.get("entry_price", price) or 0.0)
         notional = abs(price * qty)
+        margin_usdt = self._calc_margin_usdt(price, qty, leverage)
         tp_price = trade.get("rr_tp_price", trade.get("tp_price"))
         sl_price = trade.get("rr_stop_price", trade.get("stop_price"))
         pnl = trade.get("pnl")
+        ret = float(trade.get("return", 0.0) or 0.0)
+        if trade_type in {"exit", "exit_partial"}:
+            computed_pnl, computed_ret = self._calc_trade_pnl_return(
+                entry_price, price, qty, direction, leverage
+            )
+            if pnl is None or (float(pnl) == 0.0 and abs(price - entry_price) > 0 and qty > 0):
+                pnl = computed_pnl
+            if ret == 0.0 and abs(price - entry_price) > 0 and qty > 0:
+                ret = computed_ret
         pnl_text = f"{float(pnl):+.2f}" if pnl is not None else "n/a"
         exit_reason = trade.get("exit_reason")
         reason_text = f" | 사유: {exit_reason}" if exit_reason else ""
@@ -4673,15 +5639,20 @@ class BacktestBot(commands.Bot):
         )
         embed.add_field(
             name="가격/수량",
-            value=f"가격: {self._fmt_price(price)}\n수량: {qty:.6g}\n금액: {notional:,.2f}",
+            value=(
+                f"가격: {self._fmt_price(price)}\n"
+                f"수량: {qty:.6g}\n"
+                f"레버리지 적용 금액: {notional:,.2f}\n"
+                f"투입 원금: {margin_usdt:,.2f}"
+            ),
             inline=True,
         )
         embed.add_field(
             name="레버리지/TP/SL",
             value=(
                 f"{leverage:.2f}x\n"
-                f"TP: {self._fmt_price(tp_price)}\n"
-                f"SL: {self._fmt_price(sl_price)}"
+                f"TP: {self._fmt_target_with_pct(entry_price, tp_price, direction, leverage)}\n"
+                f"SL: {self._fmt_target_with_pct(entry_price, sl_price, direction, leverage)}"
             ),
             inline=True,
         )
@@ -4691,13 +5662,60 @@ class BacktestBot(commands.Bot):
             inline=False,
         )
         if trade_type in {"exit", "exit_partial"}:
-            ret_pct = float(trade.get("return", 0.0)) * 100.0
+            ret_pct = ret * 100.0
             embed.add_field(
                 name="수익",
                 value=f"수익률: {ret_pct:+.2f}%\n수익금: {pnl_text}{reason_text}",
                 inline=False,
             )
         await channel.send(embed=embed)
+
+    async def _append_trade_log(self, group: str, trade: Dict[str, Any]) -> None:
+        path = self._trade_log_path(group)
+        payload = {
+            "logged_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "group": group,
+            "symbol": self._runner_symbol(group),
+            "trade": self._normalize_trade_for_log(trade),
+        }
+        await asyncio.to_thread(self._write_jsonl, path, payload)
+
+    def _trade_log_path(self, group: str) -> Path:
+        cfg = self._get_realtime_cfg(group)
+        raw_path = None
+        if isinstance(cfg, dict):
+            raw_path = cfg.get("trade_log_path")
+        if not raw_path:
+            raw_path = f"backtest/trade_logs/{group}_trades.jsonl"
+        return Path(str(raw_path))
+
+    def _runner_symbol(self, group: str) -> str:
+        runner = self._runner_for_group(group)
+        if runner is None:
+            return "UNKNOWN"
+        return runner.symbol
+
+    @staticmethod
+    def _write_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+                handle.write("\n")
+        except Exception:
+            return
+
+    @staticmethod
+    def _normalize_trade_for_log(trade: Dict[str, Any]) -> Dict[str, Any]:
+        normalized: Dict[str, Any] = {}
+        for key, value in trade.items():
+            if isinstance(value, (datetime, pd.Timestamp)):
+                normalized[key] = value.isoformat()
+            elif isinstance(value, (np.integer, np.floating)):
+                normalized[key] = value.item()
+            else:
+                normalized[key] = value
+        return normalized
 
     async def _send_trade_result(
         self,
@@ -4718,10 +5736,19 @@ class BacktestBot(commands.Bot):
         qty = float(trade.get("qty", 0.0) or 0.0)
         leverage = float(trade.get("leverage", 1.0) or 1.0)
         notional = abs(entry_price * qty)
-        ret_pct = float(trade.get("return", 0.0)) * 100.0
+        margin_usdt = self._calc_margin_usdt(entry_price, qty, leverage)
+        ret = float(trade.get("return", 0.0) or 0.0)
+        pnl = float(trade.get("pnl", 0.0) or 0.0)
+        computed_pnl, computed_ret = self._calc_trade_pnl_return(
+            entry_price, exit_price, qty, direction, leverage
+        )
+        if pnl == 0.0 and abs(exit_price - entry_price) > 0 and qty > 0:
+            pnl = computed_pnl
+        if ret == 0.0 and abs(exit_price - entry_price) > 0 and qty > 0:
+            ret = computed_ret
+        ret_pct = ret * 100.0
         min_ret = float(trade.get("min_return", 0.0)) * 100.0
         max_ret = float(trade.get("max_return", 0.0)) * 100.0
-        pnl = float(trade.get("pnl", 0.0))
         exit_reason = trade.get("exit_reason", "unknown")
         entry_reason = trade.get("entry_reason", "unknown")
         tp_price = trade.get("rr_tp_price", trade.get("tp_price"))
@@ -4775,8 +5802,8 @@ class BacktestBot(commands.Bot):
             name="레버리지/TP/SL",
             value=(
                 f"{leverage:.2f}x\n"
-                f"TP: {self._fmt_price(tp_price)}\n"
-                f"SL: {self._fmt_price(sl_price)}"
+                f"TP: {self._fmt_target_with_pct(entry_price, tp_price, direction, leverage)}\n"
+                f"SL: {self._fmt_target_with_pct(entry_price, sl_price, direction, leverage)}"
             ),
             inline=True,
         )
@@ -4791,7 +5818,11 @@ class BacktestBot(commands.Bot):
         )
         embed.add_field(
             name="손익",
-            value=f"매수 USDT: {notional:,.2f}\n순수익: {pnl:+,.2f}",
+            value=(
+                f"레버리지 적용 금액 USDT: {notional:,.2f}\n"
+                f"투입 원금 USDT: {margin_usdt:,.2f}\n"
+                f"순수익: {pnl:+,.2f}"
+            ),
             inline=True,
         )
         embed.add_field(
@@ -4992,6 +6023,10 @@ class BacktestBot(commands.Bot):
             if group == "live":
                 return self.live_tradelog_channel_name
             return None
+        if kind == "log":
+            if group == "live":
+                return self.live_log_channel_name
+            return None
         return None
 
     async def _get_or_create_group_channel(
@@ -5029,6 +6064,15 @@ class BacktestBot(commands.Bot):
     ) -> Optional[discord.TextChannel]:
         group = self._resolve_channel_group(channel)
         name = self._group_channel_name(group, "tradelog")
+        if not name:
+            return None
+        return await self._get_or_create_group_channel(group, name)
+
+    async def _get_log_channel(
+        self, channel: Optional[discord.abc.GuildChannel] = None
+    ) -> Optional[discord.TextChannel]:
+        group = self._resolve_channel_group(channel)
+        name = self._group_channel_name(group, "log")
         if not name:
             return None
         return await self._get_or_create_group_channel(group, name)
@@ -5401,6 +6445,16 @@ class BacktestBot(commands.Bot):
             current = current[part]
         return current
 
+    def _has_setting_key_from(self, settings: Settings, section: str, key: str) -> bool:
+        target = getattr(settings, section)
+        parts = key.split(".") if key else []
+        current: Any = target
+        for part in parts:
+            if not isinstance(current, dict) or part not in current:
+                return False
+            current = current[part]
+        return True
+
     def _apply_setting_value_to(
         self,
         settings: Settings,
@@ -5444,6 +6498,44 @@ class BacktestBot(commands.Bot):
         else:
             self.live_cfg = cfg
         return cfg
+
+    def _apply_backtest_settings_to_realtime(
+        self, group: str
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        cfg = self._get_realtime_cfg(group)
+        bt_cfg = self.settings.backtest if isinstance(self.settings.backtest, dict) else {}
+        strategy_cfg = self.settings.strategy if isinstance(self.settings.strategy, dict) else {}
+        data_cfg = self.settings.data if isinstance(self.settings.data, dict) else {}
+        applied: Dict[str, Any] = {}
+
+        cfg["backtest"] = copy.deepcopy(bt_cfg)
+        cfg["strategy"] = copy.deepcopy(strategy_cfg)
+        cfg["data"] = copy.deepcopy(data_cfg)
+        applied["backtest"] = copy.deepcopy(bt_cfg)
+        applied["strategy"] = copy.deepcopy(strategy_cfg)
+        applied["data"] = copy.deepcopy(data_cfg)
+
+        for key, value in bt_cfg.items():
+            cfg[key] = value
+            applied[key] = value
+
+        strategy_name = strategy_cfg.get("name") if isinstance(strategy_cfg, dict) else None
+        if isinstance(strategy_name, str) and strategy_name:
+            cfg["strategy_name"] = strategy_name
+            applied["strategy_name"] = strategy_name
+        strategy_params = strategy_cfg.get("params") if isinstance(strategy_cfg, dict) else None
+        if isinstance(strategy_params, dict):
+            cfg["strategy_params"] = copy.deepcopy(strategy_params)
+            applied["strategy_params"] = copy.deepcopy(strategy_params)
+
+        summary = {
+            "backtest_keys": sorted(bt_cfg.keys()),
+            "strategy_name": strategy_name if isinstance(strategy_name, str) else None,
+            "strategy_params_keys": sorted(strategy_params.keys()) if isinstance(strategy_params, dict) else [],
+            "data_keys": sorted(data_cfg.keys()),
+        }
+        save_settings(self.settings_path, self.settings)
+        return applied, summary
 
     def _get_live_client(self) -> tuple[Optional[BinanceFuturesClient], Optional[str]]:
         cfg = self._get_realtime_cfg("live")
@@ -5515,6 +6607,21 @@ class BacktestBot(commands.Bot):
         return price * (1.0 + offset)
 
     @staticmethod
+    def _apply_maker_aggressive_ticks(
+        price: float, side: str, tick_size: float, ticks: int
+    ) -> float:
+        if price <= 0 or tick_size <= 0:
+            return price
+        ticks = int(ticks or 0)
+        if ticks <= 0:
+            return price
+        delta = tick_size * ticks
+        if side.upper() == "BUY":
+            return price + delta
+        adjusted = price - delta
+        return adjusted if adjusted > 0 else price
+
+    @staticmethod
     def _price_bounds(
         reference_price: float, filters: Optional[Any]
     ) -> Tuple[Optional[float], Optional[float]]:
@@ -5532,6 +6639,152 @@ class BacktestBot(commands.Bot):
                 candidate = reference_price * percent_up
                 max_price = candidate if max_price is None else min(max_price, candidate)
         return min_price, max_price
+
+    @staticmethod
+    def _ceil_step(value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return math.ceil(value / step) * step
+
+    async def _run_live_api_check(self, ctx: commands.Context) -> None:
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!live check` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can run live API checks.")
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        symbol = str(cfg.get("symbol", "XRPUSDT")).upper()
+        lines: List[str] = ["Live API check"]
+
+        try:
+            await asyncio.to_thread(client.ping)
+            lines.append("- ✅ Public ping OK")
+        except Exception as exc:
+            lines.append(f"- ❌ Public ping failed: {self._format_binance_error(exc)}")
+
+        try:
+            payload = await asyncio.to_thread(client.get_server_time)
+            server_ms = int(payload.get("serverTime", 0) or 0)
+            if server_ms > 0:
+                drift_ms = server_ms - int(time.time() * 1000)
+                server_dt = datetime.fromtimestamp(server_ms / 1000, tz=timezone.utc)
+                lines.append(
+                    f"- ✅ Server time OK: {server_dt.isoformat()} (drift {drift_ms} ms)"
+                )
+            else:
+                lines.append("- ⚠️ Server time unavailable")
+        except Exception as exc:
+            lines.append(f"- ❌ Server time failed: {self._format_binance_error(exc)}")
+
+        dual_side = None
+        try:
+            mode = await asyncio.to_thread(client.get_position_mode)
+            dual_side = bool(mode.get("dualSidePosition"))
+            mode_text = "HEDGE" if dual_side else "ONE-WAY"
+            lines.append(f"- ✅ Position mode OK: {mode_text}")
+        except Exception as exc:
+            lines.append(f"- ❌ Position mode failed: {self._format_binance_error(exc)}")
+
+        available = None
+        wallet = None
+        try:
+            account = await asyncio.to_thread(client.get_account)
+            if isinstance(account, dict):
+                assets = account.get("assets") or []
+                for asset in assets:
+                    if str(asset.get("asset", "")).upper() == "USDT":
+                        try:
+                            available = float(asset.get("availableBalance", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            available = None
+                        try:
+                            wallet = float(asset.get("walletBalance", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            wallet = None
+                        break
+            available_text = f"{available:,.2f}" if available is not None else "n/a"
+            wallet_text = f"{wallet:,.2f}" if wallet is not None else "n/a"
+            lines.append(f"- ✅ Signed account OK: available {available_text}, wallet {wallet_text}")
+        except Exception as exc:
+            lines.append(f"- ❌ Signed account failed: {self._format_binance_error(exc)}")
+
+        price = None
+        filters = None
+        try:
+            price = float(await asyncio.to_thread(client.get_price, symbol))
+            lines.append(f"- ✅ Price OK: {symbol} {self._fmt_price(price)}")
+        except Exception as exc:
+            lines.append(f"- ❌ Price failed: {self._format_binance_error(exc)}")
+
+        try:
+            filters = await asyncio.to_thread(client.get_symbol_filters, symbol)
+            min_notional = filters.min_notional
+            tick = filters.tick_size
+            step = filters.step_size
+            min_notional_text = f"{min_notional:,.4g}" if min_notional else "n/a"
+            lines.append(
+                f"- ✅ Symbol filters OK: tick {tick:g}, step {step:g}, min_notional {min_notional_text}"
+            )
+        except Exception as exc:
+            lines.append(f"- ❌ Symbol filters failed: {self._format_binance_error(exc)}")
+
+        if price and filters:
+            min_price, max_price = self._price_bounds(price, filters)
+            min_notional = filters.min_notional or 0.0
+            step_size = filters.step_size or 0.0
+            tick_size = filters.tick_size or 0.0
+            notional = max(min_notional, 5.0)
+            qty = notional / price if price > 0 else 0.0
+            if filters.min_qty and qty < filters.min_qty:
+                qty = filters.min_qty
+            qty = self._ceil_step(qty, step_size)
+            if min_notional > 0 and qty * price < min_notional:
+                qty = self._ceil_step(min_notional / price, step_size)
+
+            buy_price = RealtimeRunner._round_price_with_bounds(
+                price, tick_size, "BUY", min_price, max_price
+            )
+            sell_price = RealtimeRunner._round_price_with_bounds(
+                price, tick_size, "SELL", min_price, max_price
+            )
+            if buy_price > 0 and sell_price > 0 and qty > 0:
+                try:
+                    await asyncio.to_thread(
+                        client.test_order,
+                        symbol,
+                        "BUY",
+                        qty,
+                        buy_price,
+                        position_side="LONG" if dual_side else None,
+                    )
+                    lines.append("- ✅ Test BUY order OK (no execution)")
+                except Exception as exc:
+                    lines.append(f"- ❌ Test BUY order failed: {self._format_binance_error(exc)}")
+                try:
+                    await asyncio.to_thread(
+                        client.test_order,
+                        symbol,
+                        "SELL",
+                        qty,
+                        sell_price,
+                        position_side="SHORT" if dual_side else None,
+                    )
+                    lines.append("- ✅ Test SELL order OK (no execution)")
+                except Exception as exc:
+                    lines.append(f"- ❌ Test SELL order failed: {self._format_binance_error(exc)}")
+            else:
+                lines.append("- ⚠️ Test order skipped: invalid price/qty")
+        else:
+            lines.append("- ⚠️ Test order skipped: price/filter unavailable")
+
+        await ctx.reply("\n".join(lines))
 
     @staticmethod
     def _extract_binance_error(
@@ -5729,6 +6982,7 @@ class BacktestBot(commands.Bot):
         reduce_only: bool,
         position_side: str,
         maker_offset_bps: float,
+        maker_aggressive_ticks: int,
         retry_seconds: float,
         max_attempts: int,
     ) -> Dict[str, Any]:
@@ -5784,6 +7038,9 @@ class BacktestBot(commands.Bot):
                     reference_price = target_price
             adjusted_price = self._apply_maker_offset(
                 float(target_price), side, maker_offset_bps
+            )
+            adjusted_price = self._apply_maker_aggressive_ticks(
+                adjusted_price, side, tick_size, maker_aggressive_ticks
             )
             if post_only_rejects > 0:
                 nudge = tick_size if tick_size > 0 else adjusted_price * 0.0001
@@ -5963,7 +7220,7 @@ class BacktestBot(commands.Bot):
             return
 
         cfg = self._get_realtime_cfg("live")
-        retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
+        retry_seconds = float(cfg.get("live_order_retry_seconds", 20.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
         notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
@@ -6026,6 +7283,7 @@ class BacktestBot(commands.Bot):
             reduce_only=draft.reduce_only,
             position_side=draft.position_side,
             maker_offset_bps=draft.maker_offset_bps,
+            maker_aggressive_ticks=draft.maker_aggressive_ticks,
             retry_seconds=retry_seconds,
             max_attempts=max_attempts,
         )
@@ -6045,9 +7303,11 @@ class BacktestBot(commands.Bot):
         remaining_text = (
             f"\nRemaining qty: {remaining_qty:.6g}" if remaining_qty > 0 else ""
         )
+        margin_usdt = self._calc_margin_usdt(draft.price, qty, draft.leverage)
         await _send(
             f"Live order {status}: {draft.position_side} {qty:.6g} {draft.symbol} "
-            f"@ {self._fmt_price(draft.price)} (lev {draft.leverage:.2f}x){suffix}"
+            f"@ {self._fmt_price(draft.price)} (lev {draft.leverage:.2f}x, "
+            f"margin {margin_usdt:,.2f} USDT){suffix}"
             f"{remaining_text}{extras}",
             ephemeral=isinstance(target, discord.Interaction),
         )
@@ -6088,7 +7348,7 @@ class BacktestBot(commands.Bot):
             return
 
         cfg = self._get_realtime_cfg("live")
-        retry_seconds = float(cfg.get("live_order_retry_seconds", 30.0) or 0.0)
+        retry_seconds = float(cfg.get("live_order_retry_seconds", 20.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
         notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
@@ -6110,6 +7370,7 @@ class BacktestBot(commands.Bot):
             reduce_only=True,
             position_side=draft.position_side,
             maker_offset_bps=draft.maker_offset_bps,
+            maker_aggressive_ticks=draft.maker_aggressive_ticks,
             retry_seconds=retry_seconds,
             max_attempts=max_attempts,
         )
@@ -6136,6 +7397,14 @@ class BacktestBot(commands.Bot):
 
     def _sim_initial_balance(self) -> float:
         cfg = self._get_realtime_cfg("sim")
+        value = cfg.get("initial_balance", self.settings.backtest.get("initial_balance"))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _live_initial_balance(self) -> float:
+        cfg = self._get_realtime_cfg("live")
         value = cfg.get("initial_balance", self.settings.backtest.get("initial_balance"))
         try:
             return float(value)
@@ -6214,14 +7483,15 @@ class BacktestBot(commands.Bot):
             if not index_text.isdigit():
                 return None, "List index must be a number like [1]."
             index = int(index_text) - 1
+            if not self._has_setting_key_from(settings, section, base_key):
+                return None, "That key does not exist in settings."
             current_list = self._get_setting_value_from(settings, section, base_key)
             if not isinstance(current_list, list):
                 return None, "That key is not a list."
             if index < 0 or index >= len(current_list):
                 return None, "List index is out of range."
         else:
-            current_value = self._get_setting_value_from(settings, section, key)
-            if current_value is None:
+            if not self._has_setting_key_from(settings, section, key):
                 return None, "That key does not exist in settings."
         return {
             "section": section,
@@ -6792,11 +8062,19 @@ class BacktestBot(commands.Bot):
         return entries
 
     def _grid_variable_keys(self) -> List[str]:
+        optional_numeric_keys = {
+            "strategy.params.auto_leverage_max_loss_pnl",
+        }
         keys: List[str] = []
         for full_key, value in self._flatten_settings():
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) or full_key in optional_numeric_keys:
                 keys.append(full_key)
         return sorted(set(keys))
+
+    def _ensure_strategy_param_defaults(self) -> None:
+        params = self.settings.strategy.setdefault("params", {})
+        if "auto_leverage_max_loss_pnl" not in params:
+            params["auto_leverage_max_loss_pnl"] = None
 
     @staticmethod
     def _parse_costom_params(
@@ -7082,6 +8360,9 @@ class BacktestBot(commands.Bot):
         entry_minute_stats: Dict[str, Any],
         entry_minute_tp_df: pd.DataFrame,
         entry_minute_tp_stats: Dict[str, Any],
+        tp_target_stats: Dict[str, Any],
+        sl_target_stats: Dict[str, Any],
+        tp_hit_stats: Dict[str, Any],
     ) -> str:
         months = int(stats.get("months", 0) or 0)
         lines = [
@@ -7094,6 +8375,32 @@ class BacktestBot(commands.Bot):
         if months <= 0:
             lines.append("- No monthly returns available.")
             monthly_output = "\n".join(lines)
+            target_lines = [
+                "━━━━━━━━━━━━━━━━━━",
+                "Target win-rate distribution",
+            ]
+            tp_covered = int(tp_target_stats.get("trades_with_target", 0) or 0)
+            sl_covered = int(sl_target_stats.get("trades_with_target", 0) or 0)
+            tp_buckets = int(tp_target_stats.get("buckets", 0) or 0)
+            sl_buckets = int(sl_target_stats.get("buckets", 0) or 0)
+            tp_trades = int(tp_target_stats.get("trades", 0) or 0)
+            sl_trades = int(sl_target_stats.get("trades", 0) or 0)
+            tp_hits = int(tp_hit_stats.get("tp_hits", 0) or 0)
+            tp_rate = float(tp_hit_stats.get("tp_rate", 0.0) or 0.0)
+            tp_total = int(tp_hit_stats.get("trades", 0) or 0)
+            if tp_trades or sl_trades:
+                target_lines.append(
+                    f"- TP targets: {tp_covered}/{tp_trades} trades | buckets {tp_buckets}"
+                )
+                target_lines.append(
+                    f"- SL targets: {sl_covered}/{sl_trades} trades | buckets {sl_buckets}"
+                )
+            else:
+                target_lines.append("- n/a")
+            if tp_total > 0:
+                target_lines.append(f"- TP hit rate: {tp_hits}/{tp_total} ({tp_rate:.1f}%)")
+            else:
+                target_lines.append("- TP hit rate: n/a")
             entry_lines = [
                 "━━━━━━━━━━━━━━━━━━",
                 "Entry minute win rate (by entry time)",
@@ -7136,7 +8443,7 @@ class BacktestBot(commands.Bot):
                     tp_hits = int(row.get("tp_hits", 0))
                     total = int(row.get("total", 0))
                     entry_lines.append(f"- {label}: {tp_rate:.1f}% (TP {tp_hits} / T {total})")
-            return "\n".join([monthly_output, *entry_lines])
+            return "\n".join([monthly_output, *target_lines, *entry_lines])
 
         mean = stats.get("mean", 0.0)
         median = stats.get("median", 0.0)
@@ -7171,6 +8478,33 @@ class BacktestBot(commands.Bot):
                 else:
                     lines.append(f"- {month}: {float(value):.2f}%")
             monthly_output = "\n".join(lines)
+
+        target_lines = [
+            "━━━━━━━━━━━━━━━━━━",
+            "Target win-rate distribution",
+        ]
+        tp_covered = int(tp_target_stats.get("trades_with_target", 0) or 0)
+        sl_covered = int(sl_target_stats.get("trades_with_target", 0) or 0)
+        tp_buckets = int(tp_target_stats.get("buckets", 0) or 0)
+        sl_buckets = int(sl_target_stats.get("buckets", 0) or 0)
+        tp_trades = int(tp_target_stats.get("trades", 0) or 0)
+        sl_trades = int(sl_target_stats.get("trades", 0) or 0)
+        tp_hits = int(tp_hit_stats.get("tp_hits", 0) or 0)
+        tp_rate = float(tp_hit_stats.get("tp_rate", 0.0) or 0.0)
+        tp_total = int(tp_hit_stats.get("trades", 0) or 0)
+        if tp_trades or sl_trades:
+            target_lines.append(
+                f"- TP targets: {tp_covered}/{tp_trades} trades | buckets {tp_buckets}"
+            )
+            target_lines.append(
+                f"- SL targets: {sl_covered}/{sl_trades} trades | buckets {sl_buckets}"
+            )
+        else:
+            target_lines.append("- n/a")
+        if tp_total > 0:
+            target_lines.append(f"- TP hit rate: {tp_hits}/{tp_total} ({tp_rate:.1f}%)")
+        else:
+            target_lines.append("- TP hit rate: n/a")
 
         entry_lines = [
             "━━━━━━━━━━━━━━━━━━",
@@ -7215,7 +8549,7 @@ class BacktestBot(commands.Bot):
                 total = int(row.get("total", 0))
                 entry_lines.append(f"- {label}: {tp_rate:.1f}% (TP {tp_hits} / T {total})")
 
-        return "\n".join([monthly_output, *entry_lines])
+        return "\n".join([monthly_output, *target_lines, *entry_lines])
 
     async def _run_grid_from_interaction(
         self,
@@ -7660,9 +8994,32 @@ class BacktestBot(commands.Bot):
 
         self._last_backtest = {"result": result, "data": data}
         data_pattern = settings_copy.data.get("file_pattern", "*.csv")
-        monthly_df, stats = compute_monthly_return_stats(result)
-        entry_minute_df, entry_minute_stats = compute_entry_minute_win_rate(result)
-        entry_minute_tp_df, entry_minute_tp_stats = compute_entry_minute_tp_rate(result)
+        monthly_df, stats = await asyncio.to_thread(
+            compute_monthly_return_stats,
+            result,
+        )
+        entry_minute_df, entry_minute_stats = await asyncio.to_thread(
+            compute_entry_minute_win_rate,
+            result,
+        )
+        entry_minute_tp_df, entry_minute_tp_stats = await asyncio.to_thread(
+            compute_entry_minute_tp_rate,
+            result,
+        )
+        _, tp_target_stats = await asyncio.to_thread(
+            compute_tp_target_win_rate,
+            result,
+            5.0,
+        )
+        _, sl_target_stats = await asyncio.to_thread(
+            compute_sl_target_win_rate,
+            result,
+            5.0,
+        )
+        tp_hit_stats = await asyncio.to_thread(
+            compute_tp_hit_rate,
+            result,
+        )
         message = BacktestBot._format_costom4_output(
             data_label=str(data_pattern),
             monthly_df=monthly_df,
@@ -7671,6 +9028,9 @@ class BacktestBot(commands.Bot):
             entry_minute_stats=entry_minute_stats,
             entry_minute_tp_df=entry_minute_tp_df,
             entry_minute_tp_stats=entry_minute_tp_stats,
+            tp_target_stats=tp_target_stats,
+            sl_target_stats=sl_target_stats,
+            tp_hit_stats=tp_hit_stats,
         )
 
         with tempfile.NamedTemporaryFile(
@@ -7709,6 +9069,76 @@ class BacktestBot(commands.Bot):
             tp_output_path,
             title=f"Entry minute TP reach rate ({data_pattern})",
         )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_tp_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_target_output_path = Path(tmp_file.name)
+        tp_target_chart = await asyncio.to_thread(
+            create_tp_target_win_rate_chart,
+            result,
+            tp_target_output_path,
+            5.0,
+            f"Win rate by target TP (bin=5) ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_sl_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            sl_target_output_path = Path(tmp_file.name)
+        sl_target_chart = await asyncio.to_thread(
+            create_sl_target_win_rate_chart,
+            result,
+            sl_target_output_path,
+            5.0,
+            f"Win rate by target SL (bin=5) ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_tp_sl_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_sl_target_output_path = Path(tmp_file.name)
+        tp_sl_target_chart = await asyncio.to_thread(
+            create_tp_sl_target_win_rate_chart,
+            result,
+            tp_sl_target_output_path,
+            5.0,
+            f"Win rate by target TP/SL (bin=5) ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_entry_hour_reason_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            entry_hour_reason_path = Path(tmp_file.name)
+        entry_hour_reason_chart = await asyncio.to_thread(
+            create_entry_hour_exit_reason_group_chart,
+            result,
+            entry_hour_reason_path,
+            title=f"Entry hour by exit reason (TP/SL/Slopeexit) ({data_pattern})",
+        )
+        entry_feature_chart = None
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            entry_feature_frame = await asyncio.to_thread(
+                build_entry_feature_frame,
+                result,
+                data,
+            )
+            with tempfile.NamedTemporaryFile(
+                prefix="costom4_entry_feature_reason_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                entry_feature_path = Path(tmp_file.name)
+            entry_feature_chart = await asyncio.to_thread(
+                create_exit_reason_entry_feature_mean_chart,
+                entry_feature_frame,
+                entry_feature_path,
+                title=f"Entry feature means by exit reason ({data_pattern})",
+            )
         equity_price_chart = None
         if isinstance(data, pd.DataFrame) and not data.empty:
             with tempfile.NamedTemporaryFile(
@@ -7740,6 +9170,16 @@ class BacktestBot(commands.Bot):
             chart_paths.append(entry_minute_chart)
         if entry_minute_tp_chart:
             chart_paths.append(entry_minute_tp_chart)
+        if tp_target_chart:
+            chart_paths.append(tp_target_chart)
+        if sl_target_chart:
+            chart_paths.append(sl_target_chart)
+        if tp_sl_target_chart:
+            chart_paths.append(tp_sl_target_chart)
+        if entry_hour_reason_chart:
+            chart_paths.append(entry_hour_reason_chart)
+        if entry_feature_chart:
+            chart_paths.append(entry_feature_chart)
         if equity_price_chart:
             chart_paths.append(equity_price_chart)
         if not chart_paths:
@@ -8300,6 +9740,9 @@ class BacktestBot(commands.Bot):
         if not selected:
             return []
 
+        strategy = self._build_strategy_for_backtest()
+        lookback, lookback_label = self._resolve_prev_extreme_lookback(strategy)
+
         payloads: List[Tuple[str, Path]] = []
         total = len(selected)
         for idx, trade in enumerate(selected, start=1):
@@ -8320,6 +9763,107 @@ class BacktestBot(commands.Bot):
                 )
             if chart_path:
                 message = f"🔎 Entry reason: {reason}"
+                payloads.append((message, chart_path))
+
+            if lookback:
+                direction_value = int(trade.get("direction", 0))
+                if direction_value != 0:
+                    entry_time = trade.get("entry_time")
+                    entry_idx = self._resolve_trade_index(data, entry_time)
+                    extreme_idx, extreme_price = self._find_lookback_extreme(
+                        data, entry_idx, lookback, direction_value
+                    )
+                    if extreme_idx is not None:
+                        if "timestamp" in data.columns:
+                            extreme_time: Any = data.iloc[extreme_idx]["timestamp"]
+                        else:
+                            extreme_time = extreme_idx
+                        extreme_label = "low" if direction_value > 0 else "high"
+                        lookback_title = (
+                            f"{direction} trade {idx}/{total} | lookback {extreme_label} → entry"
+                            f" (n={lookback})"
+                        )
+                        with tempfile.NamedTemporaryFile(
+                            prefix="backtest_trade_lookback_",
+                            suffix=".png",
+                            delete=False,
+                        ) as tmp_file:
+                            lookback_path = create_trade_lookback_extreme_chart(
+                                data,
+                                entry_time,
+                                extreme_time,
+                                extreme_price,
+                                Path(tmp_file.name),
+                                title=lookback_title,
+                                max_candles=400,
+                            )
+                        if lookback_path:
+                            label = f"{lookback_label}" if lookback_label else "lookback"
+                            message = f"📌 {label}: {extreme_label} → entry (n={lookback})"
+                            payloads.append((message, lookback_path))
+        return payloads
+
+    @staticmethod
+    def _format_trade_timestamp(value: Any, tz_name: Optional[str]) -> str:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return "N/A"
+        if tz_name:
+            try:
+                ts = ts.tz_convert(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        return ts.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _format_trade_price(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if not math.isfinite(number):
+            return "N/A"
+        return f"{number:.6g}"
+
+    def _build_recent_trade_payloads(
+        self,
+        trades: List[Dict[str, Any]],
+        data: pd.DataFrame,
+        tz_name: Optional[str],
+    ) -> List[Tuple[str, Path]]:
+        if not trades or data is None or data.empty:
+            return []
+
+        payloads: List[Tuple[str, Path]] = []
+        total = len(trades)
+        for idx, trade in enumerate(trades, start=1):
+            ret_pct = float(trade.get("return", 0.0)) * 100.0
+            direction = "Long" if trade.get("direction") == 1 else "Short"
+            entry_ts = self._format_trade_timestamp(trade.get("entry_time"), tz_name)
+            exit_ts = self._format_trade_timestamp(trade.get("timestamp"), tz_name)
+            tp_val = trade.get("rr_tp_price", trade.get("tp_price", trade.get("tp")))
+            sl_val = trade.get(
+                "rr_stop_price",
+                trade.get("stop_price", trade.get("sl_price", trade.get("sl"))),
+            )
+            tp_str = self._format_trade_price(tp_val)
+            sl_str = self._format_trade_price(sl_val)
+            title = f"{direction} {idx}/{total} | {entry_ts} → {exit_ts} | {ret_pct:+.2f}%"
+            with tempfile.NamedTemporaryFile(
+                prefix="backtest_recent_trade_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                chart_path = create_trade_snapshot_chart(
+                    data,
+                    trade,
+                    Path(tmp_file.name),
+                    title=title,
+                )
+            if chart_path:
+                message = f"📅 {entry_ts} → {exit_ts} | TP {tp_str} | SL {sl_str}"
                 payloads.append((message, chart_path))
         return payloads
 
@@ -8767,6 +10311,109 @@ class BacktestBot(commands.Bot):
                 strategy_overrides,
             ),
         )
+
+    async def recent_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can run backtests.")
+            return
+        if not self._is_backtest_channel(ctx.channel):
+            await ctx.reply(self._backtest_channel_notice())
+            return
+
+        tokens = shlex.split(args) if args else []
+        if tokens:
+            await ctx.reply("Usage: `!recent`")
+            return
+
+        self.settings = load_settings(self.settings_path)
+        defaults = self._get_download_defaults()
+        symbol = defaults.get("symbol") or str(self.live_cfg.get("symbol") or self.sim_cfg.get("symbol") or "")
+        interval = defaults.get("interval") or str(self.live_cfg.get("interval") or self.sim_cfg.get("interval") or "")
+        market = (defaults.get("market") or "futures").lower()
+
+        if not symbol or not interval:
+            await ctx.reply("Missing symbol/interval. Set download defaults or live/sim symbol/interval first.")
+            return
+
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=5)
+        start = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+        end = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        await ctx.reply("Fetching recent 5-day data and running backtest...")
+        output_dir = self.settings.data.get("folder", "price data")
+        loop = asyncio.get_running_loop()
+        try:
+            file_path = await loop.run_in_executor(
+                None,
+                download_price_data,
+                symbol,
+                interval,
+                start,
+                end,
+                output_dir,
+                market,
+            )
+        except Exception as exc:
+            await ctx.reply(f"Recent data download failed: {exc}")
+            return
+
+        data_overrides = {"file_pattern": file_path.name}
+        backtest_overrides = {"chart": {"enabled": False}}
+        strategy_overrides: Dict[str, Any] = {}
+
+        try:
+            message, _, _, result, data = await loop.run_in_executor(
+                None,
+                run_backtest_with_result,
+                self.settings,
+                data_overrides,
+                backtest_overrides,
+                strategy_overrides,
+            )
+        except Exception as exc:
+            await ctx.reply(f"Recent backtest failed: {exc}")
+            return
+
+        self._last_backtest = {"result": result, "data": data}
+        exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+        tz_name = self.settings.data.get("timezone", "UTC")
+
+        result_channel = await self._get_result_channel()
+        destination = result_channel.send if result_channel else ctx.reply
+
+        header = (
+            f"**📌 Recent 5-day backtest**\n"
+            f"🧾 Data: {symbol.upper()} | {interval} | {start_dt.strftime('%Y-%m-%d')} → "
+            f"{end_dt.strftime('%Y-%m-%d')}\n"
+            f"📈 Trades: {len(exit_trades)}"
+        )
+        await destination(content=header)
+        await destination(content=message)
+
+        if not exit_trades:
+            await destination(content="No exit trades in the last 5 days.")
+            return
+
+        payloads = await loop.run_in_executor(
+            None,
+            self._build_recent_trade_payloads,
+            exit_trades,
+            data,
+            tz_name,
+        )
+        if not payloads:
+            await destination(content="Failed to build trade charts.")
+            return
+
+        for message_text, chart_path in payloads:
+            await destination(content=message_text, files=[discord.File(chart_path)])
+
+        if result_channel is not None:
+            await ctx.reply(f"Recent backtest complete. Results posted in #{result_channel.name}.")
 
     async def entry_diff_text(self, ctx: commands.Context, *, args: str = "") -> None:
         if ctx.guild is None:
@@ -9693,6 +11340,9 @@ class BacktestBot(commands.Bot):
         monthly_df, stats = compute_monthly_return_stats(result)
         entry_minute_df, entry_minute_stats = compute_entry_minute_win_rate(result)
         entry_minute_tp_df, entry_minute_tp_stats = compute_entry_minute_tp_rate(result)
+        _, tp_target_stats = compute_tp_target_win_rate(result, 5.0)
+        _, sl_target_stats = compute_sl_target_win_rate(result, 5.0)
+        tp_hit_stats = compute_tp_hit_rate(result)
         message = BacktestBot._format_costom4_output(
             data_label=str(data_pattern),
             monthly_df=monthly_df,
@@ -9701,6 +11351,9 @@ class BacktestBot(commands.Bot):
             entry_minute_stats=entry_minute_stats,
             entry_minute_tp_df=entry_minute_tp_df,
             entry_minute_tp_stats=entry_minute_tp_stats,
+            tp_target_stats=tp_target_stats,
+            sl_target_stats=sl_target_stats,
+            tp_hit_stats=tp_hit_stats,
         )
 
         with tempfile.NamedTemporaryFile(
@@ -9739,6 +11392,60 @@ class BacktestBot(commands.Bot):
             tp_output_path,
             title=f"Entry minute TP reach rate ({data_pattern})",
         )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_tp_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_target_output_path = Path(tmp_file.name)
+        tp_target_chart = await asyncio.to_thread(
+            create_tp_target_win_rate_chart,
+            result,
+            tp_target_output_path,
+            5.0,
+            f"Win rate by target TP (bin=5) ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_sl_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            sl_target_output_path = Path(tmp_file.name)
+        sl_target_chart = await asyncio.to_thread(
+            create_sl_target_win_rate_chart,
+            result,
+            sl_target_output_path,
+            5.0,
+            f"Win rate by target SL (bin=5) ({data_pattern})",
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="costom4_tp_sl_target_win_",
+            suffix=".png",
+            delete=False,
+        ) as tmp_file:
+            tp_sl_target_output_path = Path(tmp_file.name)
+        tp_sl_target_chart = await asyncio.to_thread(
+            create_tp_sl_target_win_rate_chart,
+            result,
+            tp_sl_target_output_path,
+            5.0,
+            f"Win rate by target TP/SL (bin=5) ({data_pattern})",
+        )
+        entry_feature_chart = None
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            entry_feature_frame = build_entry_feature_frame(result, data)
+            with tempfile.NamedTemporaryFile(
+                prefix="costom4_entry_feature_reason_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                entry_feature_path = Path(tmp_file.name)
+            entry_feature_chart = await asyncio.to_thread(
+                create_exit_reason_entry_feature_mean_chart,
+                entry_feature_frame,
+                entry_feature_path,
+                title=f"Entry feature means by exit reason ({data_pattern})",
+            )
         equity_price_chart = None
         if isinstance(data, pd.DataFrame) and not data.empty:
             with tempfile.NamedTemporaryFile(
@@ -9769,6 +11476,14 @@ class BacktestBot(commands.Bot):
             chart_paths.append(entry_minute_chart)
         if entry_minute_tp_chart:
             chart_paths.append(entry_minute_tp_chart)
+        if tp_target_chart:
+            chart_paths.append(tp_target_chart)
+        if sl_target_chart:
+            chart_paths.append(sl_target_chart)
+        if tp_sl_target_chart:
+            chart_paths.append(tp_sl_target_chart)
+        if entry_feature_chart:
+            chart_paths.append(entry_feature_chart)
         if equity_price_chart:
             chart_paths.append(equity_price_chart)
         if not chart_paths:
@@ -10157,6 +11872,132 @@ class BacktestBot(commands.Bot):
             await ctx.reply("Usage: `!graph`")
             return
         group = self._resolve_channel_group(ctx.channel)
+        await self._send_realtime_entry_chart(ctx, group)
+
+    def _build_strategy_for_runner(self, runner: RealtimeRunner) -> Optional[Any]:
+        strategy_name = str(runner.strategy_name or "").strip().lower()
+        if not strategy_name:
+            return None
+        params = runner.strategy_params or {}
+        if strategy_name == "cheatkey":
+            params = _normalize_cheatkey_params(params)
+        try:
+            strategy_class = get_strategy_class(strategy_name)
+            return strategy_class(**params)
+        except Exception:
+            logger.exception("Failed to init strategy for graph lookback: %s", strategy_name)
+            return None
+
+    def _build_strategy_for_backtest(self) -> Optional[Any]:
+        strategy_cfg = self.settings.strategy if isinstance(self.settings.strategy, dict) else {}
+        strategy_name = str(strategy_cfg.get("name") or "").strip().lower()
+        if not strategy_name:
+            return None
+        params = strategy_cfg.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        if strategy_name == "cheatkey":
+            params = _normalize_cheatkey_params(params)
+        try:
+            strategy_class = get_strategy_class(strategy_name)
+            return strategy_class(**params)
+        except Exception:
+            logger.exception(
+                "Failed to init strategy for backtest chart lookback: %s", strategy_name
+            )
+            return None
+
+    @staticmethod
+    def _resolve_prev_extreme_lookback(strategy: Optional[Any]) -> Tuple[Optional[int], Optional[str]]:
+        if strategy is None:
+            return None, None
+        use_prev_extreme_rr = bool(getattr(strategy, "use_prev_extreme_rr", False))
+        use_prev_extreme_stop = bool(getattr(strategy, "use_prev_extreme_stop", False))
+        if use_prev_extreme_rr:
+            lookback = getattr(strategy, "prev_extreme_rr_lookback", None)
+            label = "prev_extreme_rr_lookback"
+        elif use_prev_extreme_stop:
+            lookback = getattr(strategy, "prev_extreme_lookback", None)
+            label = "prev_extreme_lookback"
+        else:
+            return None, None
+        try:
+            lookback_int = int(lookback)
+        except (TypeError, ValueError):
+            return None, None
+        if lookback_int <= 0:
+            return None, None
+        return lookback_int, label
+
+    @staticmethod
+    def _infer_entry_time_from_price(
+        data: pd.DataFrame, entry_price: Any, max_rows: int = 800
+    ) -> Optional[Any]:
+        if data.empty:
+            return None
+        try:
+            price_value = float(entry_price)
+        except (TypeError, ValueError):
+            return None
+        if price_value <= 0:
+            return None
+        view = data if len(data) <= max_rows else data.iloc[-max_rows:]
+        col = None
+        for candidate in ("close", "open", "high", "low"):
+            if candidate in view.columns:
+                col = candidate
+                break
+        if col is None:
+            return None
+        series = pd.to_numeric(view[col], errors="coerce")
+        if series.isna().all():
+            return None
+        diffs = (series - price_value).abs()
+        if diffs.isna().all():
+            return None
+        idx = diffs.idxmin()
+        if "timestamp" in data.columns and idx in data.index:
+            return data.loc[idx, "timestamp"]
+        return int(idx)
+
+    @staticmethod
+    def _find_lookback_extreme(
+        data: pd.DataFrame,
+        entry_idx: Optional[int],
+        lookback: int,
+        direction: int,
+    ) -> Tuple[Optional[int], Optional[float]]:
+        if entry_idx is None or lookback <= 0:
+            return None, None
+        start_idx = entry_idx - lookback
+        if start_idx < 0:
+            return None, None
+        window = data.iloc[start_idx:entry_idx]
+        if window.empty:
+            return None, None
+        if direction > 0:
+            if "low" not in window.columns:
+                return None, None
+            series = pd.to_numeric(window["low"], errors="coerce").dropna()
+            if series.empty:
+                return None, None
+            extreme_idx = int(series.idxmin())
+        else:
+            if "high" not in window.columns:
+                return None, None
+            series = pd.to_numeric(window["high"], errors="coerce").dropna()
+            if series.empty:
+                return None, None
+            extreme_idx = int(series.idxmax())
+        try:
+            extreme_price = float(series.loc[extreme_idx])
+        except (TypeError, ValueError):
+            extreme_price = None
+        return extreme_idx, extreme_price
+
+    async def _send_realtime_entry_chart(
+        self, ctx: commands.Context, group: str
+    ) -> None:
         runner = self._runner_for_group(group)
         if runner is None or not runner.is_running():
             await ctx.reply("Runner is not active for this channel.")
@@ -10172,8 +12013,6 @@ class BacktestBot(commands.Bot):
             if not isinstance(raw, dict):
                 continue
             if not raw.get("active"):
-                continue
-            if raw.get("entry_time") is None:
                 continue
             active.append((side, raw))
         if not active:
@@ -10191,18 +12030,33 @@ class BacktestBot(commands.Bot):
         if not last_price and "close" in data.columns:
             last_price = float(data.iloc[-1].get("close", 0.0) or 0.0)
 
+        strategy = self._build_strategy_for_runner(runner)
+        lookback, _lookback_label = self._resolve_prev_extreme_lookback(strategy)
+
         chart_paths: List[Path] = []
         for side, raw in active:
+            direction = int(raw.get("direction", 0))
+            entry_time = raw.get("entry_time")
+            entry_time_approx = False
+            if entry_time is None:
+                entry_time = self._infer_entry_time_from_price(
+                    data, raw.get("entry_price")
+                )
+                if entry_time is None:
+                    entry_time = last_ts
+                    entry_time_approx = True
             trade = {
-                "entry_time": raw.get("entry_time"),
+                "entry_time": entry_time,
                 "timestamp": last_ts,
                 "entry_price": raw.get("entry_price"),
                 "price": last_price,
-                "direction": raw.get("direction", 0),
+                "direction": direction,
                 "rr_tp_price": raw.get("tp_price"),
                 "rr_stop_price": raw.get("sl_price"),
             }
             title = f"{payload.symbol} {side.upper()} entry → now"
+            if entry_time_approx:
+                title += " (approx)"
             with tempfile.NamedTemporaryFile(
                 prefix=f"{group}_{side}_graph_",
                 suffix=".png",
@@ -10219,6 +12073,40 @@ class BacktestBot(commands.Bot):
                 )
             if chart_path:
                 chart_paths.append(chart_path)
+
+            if lookback and direction != 0:
+                entry_idx = self._resolve_trade_index(data, entry_time)
+                extreme_idx, extreme_price = self._find_lookback_extreme(
+                    data, entry_idx, lookback, direction
+                )
+                if extreme_idx is not None:
+                    if "timestamp" in data.columns:
+                        extreme_time: Any = data.iloc[extreme_idx]["timestamp"]
+                    else:
+                        extreme_time = extreme_idx
+                    extreme_label = "low" if direction > 0 else "high"
+                    lookback_title = (
+                        f"{payload.symbol} {side.upper()} lookback {extreme_label} → entry"
+                        f" (n={lookback})"
+                    )
+                    if entry_time_approx:
+                        lookback_title += " (approx)"
+                    with tempfile.NamedTemporaryFile(
+                        prefix=f"{group}_{side}_lookback_",
+                        suffix=".png",
+                        delete=False,
+                    ) as tmp_file:
+                        lookback_path = create_trade_lookback_extreme_chart(
+                            data,
+                            entry_time,
+                            extreme_time,
+                            extreme_price,
+                            Path(tmp_file.name),
+                            title=lookback_title,
+                            max_candles=400,
+                        )
+                    if lookback_path:
+                        chart_paths.append(lookback_path)
         if not chart_paths:
             await ctx.reply("Failed to build chart.")
             return
@@ -10230,6 +12118,385 @@ class BacktestBot(commands.Bot):
 
     async def live_text(self, ctx: commands.Context, *, args: str = "") -> None:
         await self._realtime_text_command(ctx, group="live", args=args)
+
+    async def livetest_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live orders"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!livetest` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can place live test orders.")
+            return
+
+        cfg = self._get_realtime_cfg("live")
+        default_symbol = str(cfg.get("symbol", "XRPUSDT")).upper()
+        default_leverage = self._parse_float(
+            cfg.get("leverage", self.settings.backtest.get("leverage", 1.0)), 1.0
+        )
+        sizing_buffer = 0.99
+        position_size = self._parse_float(cfg.get("position_size", 1.0), 1.0)
+        if position_size <= 0:
+            position_size = 1.0
+        strategy_name = str(cfg.get("strategy_name", "") or "").strip().lower()
+        strategy_params = cfg.get("strategy_params")
+        if not isinstance(strategy_params, dict) and isinstance(self.settings.strategy, dict):
+            strategy_params = self.settings.strategy.get("params")
+
+        params = strategy_params if isinstance(strategy_params, dict) else {}
+        if strategy_name == "cheatkey":
+            params = _normalize_cheatkey_params(params)
+
+        strategy = None
+        if strategy_name:
+            try:
+                strategy_class = get_strategy_class(strategy_name)
+                strategy = strategy_class(**params)
+            except Exception:
+                logger.exception("Failed to init strategy for livetest sizing: %s", strategy_name)
+
+        def _resolve_entry_parts() -> int:
+            total_parts = getattr(strategy, "total_parts", None) if strategy is not None else None
+            divide_value = getattr(strategy, "divide_value", None) if strategy is not None else None
+            if total_parts is None and divide_value is None:
+                total_parts = params.get("total_parts")
+                divide_value = params.get("divide_value")
+            try:
+                if total_parts:
+                    parts = int(total_parts)
+                elif divide_value:
+                    parts = 2 ** int(divide_value)
+                else:
+                    parts = 1
+            except (TypeError, ValueError):
+                parts = 1
+            if parts <= 0:
+                parts = 1
+            return parts
+
+        entry_parts = _resolve_entry_parts()
+
+        if not args.strip():
+            usage = (
+                "Usage: `!livetest buy|sell|close [args]`\n"
+                "Entry: `!livetest buy|sell [equity_override] [price] [leverage]`\n"
+                "Close: `!livetest close [long|short] [price]`\n"
+                f"Defaults: symbol={default_symbol}, leverage={default_leverage}\n"
+                "Sizing: equity * position_size * leverage / price * 0.99 / parts (same as live entry)\n"
+                "If leverage is omitted, strategy long/short leverage override is used when configured.\n"
+                "Examples:\n"
+                f"- `!livetest buy` (uses {default_symbol} current price & available balance)\n"
+                f"- `!livetest sell 25 0.63 5`\n"
+                "- `!livetest close long`"
+            )
+            account_note = ""
+            client, err = self._get_live_client()
+            if err:
+                account_note = f"\n{err}"
+            else:
+                available, wallet, price, note = await self._fetch_live_account_snapshot(
+                    client, default_symbol
+                )
+                if note:
+                    account_note = f"\n{note}"
+                else:
+                    available_text = (
+                        f"{available:,.2f}" if available is not None else "n/a"
+                    )
+                    wallet_text = f"{wallet:,.2f}" if wallet is not None else "n/a"
+                    price_text = self._fmt_price(price)
+                    account_note = (
+                        f"\nAvailable USDT: {available_text} (wallet {wallet_text})"
+                        f"\nCurrent {default_symbol}: {price_text}"
+                        f"\nPosition size: {position_size:.2f}"
+                        f"\nEntry parts: {entry_parts}"
+                    )
+            await ctx.reply(f"{usage}{account_note}")
+            return
+
+        tokens = shlex.split(args)
+        action = tokens[0].lower() if tokens else ""
+        if action in {"close", "exit"}:
+            close_args = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+            await self.closetest_text(ctx, args=close_args)
+            return
+        if action in {"buy", "long"}:
+            direction = 1
+            side_label = "롱"
+        elif action in {"sell", "short"}:
+            direction = -1
+            side_label = "숏"
+        else:
+            await ctx.reply(
+                "Usage: `!livetest buy|sell|close [args]`"
+            )
+            return
+
+        usdt_amount = self._parse_float(tokens[1], 0.0) if len(tokens) > 1 else 0.0
+        price = self._parse_float(tokens[2], 0.0) if len(tokens) > 2 else 0.0
+        leverage_input = (
+            self._parse_float(tokens[3], default_leverage) if len(tokens) > 3 else None
+        )
+        if leverage_input is not None and leverage_input <= 0:
+            leverage_input = None
+
+        runner = self._ensure_live_runner_for_test()
+        if runner is None:
+            await ctx.reply("Live runner could not be initialized. Check API settings.")
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        available, wallet, current_price, note = await self._fetch_live_account_snapshot(
+            client, runner.symbol
+        )
+        if price <= 0 and current_price:
+            price = float(current_price)
+        if price <= 0:
+            extra = f" ({note})" if note else ""
+            await ctx.reply(f"Price unavailable for {runner.symbol}.{extra}")
+            return
+
+        equity = available if available is not None else wallet
+        if usdt_amount <= 0:
+            if equity is None:
+                await ctx.reply(
+                    "Balance unavailable. Provide `equity_override` explicitly, e.g. "
+                    "`!livetest buy 20`."
+                )
+                return
+            usdt_amount = equity
+
+        if usdt_amount <= 0:
+            await ctx.reply("Invalid equity amount.")
+            return
+
+        leverage_override = None
+        if strategy is not None:
+            leverage_override = (
+                getattr(strategy, "long_leverage", None)
+                if direction > 0
+                else getattr(strategy, "short_leverage", None)
+            )
+        if leverage_override is None:
+            if direction > 0:
+                leverage_override = params.get("long_leverage")
+            else:
+                leverage_override = params.get("short_leverage")
+
+        leverage = leverage_input if leverage_input is not None else leverage_override
+        if leverage is None:
+            leverage = default_leverage
+        leverage = self._parse_float(leverage, default_leverage)
+        if leverage <= 0:
+            leverage = default_leverage if default_leverage > 0 else 1.0
+        if leverage_input is not None:
+            leverage_source = "manual"
+        elif leverage_override is not None:
+            leverage_source = "strategy"
+        else:
+            leverage_source = "config"
+
+        base_qty = (
+            (usdt_amount * position_size * leverage) / price * sizing_buffer
+            if price > 0
+            else 0.0
+        )
+        qty = base_qty / entry_parts if entry_parts > 0 else base_qty
+        if qty <= 0:
+            await ctx.reply("Calculated quantity is too small.")
+            return
+
+        now = datetime.now(timezone.utc)
+        trade = {
+            "type": "entry",
+            "direction": direction,
+            "qty": qty,
+            "price": price,
+            "entry_price": price,
+            "leverage": leverage,
+            "timestamp": now,
+            "entry_time": now,
+            "entry_reason": "manual_test",
+        }
+        result = await runner._submit_live_order(trade)
+        await self._handle_realtime_order("live", trade, result)
+        if result.success:
+            data = runner.get_chart_data(include_live=True)
+            await self._handle_realtime_trade("live", trade, data)
+
+        status = (result.status or "error").upper()
+        detail = f" | {result.detail}" if result.detail else ""
+        notional = abs(price * qty)
+        margin_usdt = self._calc_margin_usdt(price, qty, leverage)
+        equity_note = f"{usdt_amount:,.2f}"
+        await ctx.reply(
+            f"Live test {side_label} 주문 결과: {status}{detail} "
+            f"(qty {qty:.6g} @ {self._fmt_price(price)}, lev {leverage:.2f}x, "
+            f"equity {equity_note} USDT, position_size {position_size:.2f}, "
+            f"parts {entry_parts}, buffer {sizing_buffer:.2f}, "
+            f"leverage_source {leverage_source}, "
+            f"레버리지 적용 금액 {notional:,.2f} USDT, "
+            f"투입 원금 {margin_usdt:,.2f} USDT)"
+        )
+
+    async def closetest_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_command_channel(ctx.channel):
+            await ctx.reply(self._command_channel_notice("for live orders"))
+            return
+        if not self._is_live_channel(ctx.channel):
+            await ctx.reply("`!closetest` is only available in live channels.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can place live close tests.")
+            return
+
+        tokens = shlex.split(args) if args.strip() else []
+        direction: Optional[int] = None
+        price = 0.0
+        if tokens:
+            side_token = tokens[0].lower()
+            if side_token in {"long", "sell"}:
+                direction = 1
+                tokens = tokens[1:]
+            elif side_token in {"short", "buy"}:
+                direction = -1
+                tokens = tokens[1:]
+            if tokens:
+                price = self._parse_float(tokens[0], 0.0)
+            if len(tokens) > 1:
+                await ctx.reply("Usage: `!closetest [long|short] [price]`")
+                return
+        if args.strip() and not tokens and direction is None:
+            await ctx.reply("Usage: `!closetest [long|short] [price]`")
+            return
+
+        runner = self._ensure_live_runner_for_test()
+        if runner is None:
+            await ctx.reply("Live runner could not be initialized. Check API settings.")
+            return
+
+        client, err = self._get_live_client()
+        if err:
+            await ctx.reply(err)
+            return
+
+        try:
+            positions = await asyncio.to_thread(
+                client.get_position_risk, runner.symbol
+            )
+        except Exception as exc:
+            await ctx.reply(f"Failed to fetch positions: {exc}")
+            return
+        if not isinstance(positions, list):
+            await ctx.reply("No position data returned.")
+            return
+
+        long_item = None
+        short_item = None
+        for item in positions:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "") or "").upper()
+            if symbol != runner.symbol:
+                continue
+            try:
+                position_amt = float(item.get("positionAmt", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                position_amt = 0.0
+            if position_amt > 0:
+                long_item = item
+            elif position_amt < 0:
+                short_item = item
+
+        if direction is None:
+            if long_item is not None and short_item is None:
+                direction = 1
+            elif short_item is not None and long_item is None:
+                direction = -1
+            else:
+                await ctx.reply(
+                    "Usage: `!closetest [long|short] [price]` (multiple positions found)"
+                )
+                return
+
+        selected = long_item if direction > 0 else short_item
+        if selected is None:
+            await ctx.reply("No matching open position to close.")
+            return
+
+        try:
+            qty = abs(float(selected.get("positionAmt", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            await ctx.reply("Position quantity unavailable.")
+            return
+
+        if price <= 0:
+            payload = self._realtime_payloads.get("live")
+            if payload and payload.symbol == runner.symbol and payload.price:
+                price = float(payload.price)
+            else:
+                try:
+                    price = float(await asyncio.to_thread(client.get_price, runner.symbol))
+                except Exception:
+                    price = 0.0
+        if price <= 0:
+            await ctx.reply(f"Price unavailable for {runner.symbol}.")
+            return
+
+        entry_price = self._parse_float(selected.get("entryPrice"), 0.0)
+        leverage = self._parse_float(selected.get("leverage"), 1.0)
+        if leverage <= 0:
+            leverage = 1.0
+
+        now = datetime.now(timezone.utc)
+        trade = {
+            "type": "exit",
+            "direction": direction,
+            "qty": qty,
+            "price": price,
+            "entry_price": entry_price if entry_price > 0 else price,
+            "leverage": leverage,
+            "timestamp": now,
+            "exit_time": now,
+            "exit_reason": "manual_test",
+        }
+        if entry_price > 0:
+            notional = entry_price * qty
+            pnl = (price - entry_price) * qty * direction
+            ret = pnl / notional if notional > 0 else 0.0
+            trade["pnl"] = pnl
+            trade["return"] = ret
+            trade["min_return"] = ret
+            trade["max_return"] = ret
+
+        result = await runner._submit_live_order(trade)
+        await self._handle_realtime_order("live", trade, result)
+        if result.success:
+            data = runner.get_chart_data(include_live=True)
+            await self._handle_realtime_trade("live", trade, data)
+
+        status = (result.status or "error").upper()
+        detail = f" | {result.detail}" if result.detail else ""
+        margin_usdt = self._calc_margin_usdt(price, qty, leverage)
+        side_label = "롱" if direction > 0 else "숏"
+        await ctx.reply(
+            f"Live close test {side_label} 주문 결과: {status}{detail} "
+            f"(qty {qty:.6g} @ {self._fmt_price(price)}, lev {leverage:.2f}x, "
+            f"margin {margin_usdt:,.2f} USDT)"
+        )
 
     async def order_text(self, ctx: commands.Context, *, args: str = "") -> None:
         if ctx.guild is None:
@@ -10325,6 +12592,7 @@ class BacktestBot(commands.Bot):
 
         cfg = self._get_realtime_cfg("live")
         maker_offset_bps = float(cfg.get("maker_offset_bps", 1.0) or 0.0)
+        maker_aggressive_ticks = int(cfg.get("maker_aggressive_ticks", 0) or 0)
         drafts: List[ClosePositionDraft] = []
         lines: List[str] = []
 
@@ -10357,6 +12625,9 @@ class BacktestBot(commands.Bot):
             if price <= 0:
                 continue
             order_price = self._apply_maker_offset(price, side, maker_offset_bps)
+            order_price = self._apply_maker_aggressive_ticks(
+                order_price, side, 0.0, maker_aggressive_ticks
+            )
             draft = ClosePositionDraft(
                 symbol=symbol,
                 side=side,
@@ -10364,6 +12635,7 @@ class BacktestBot(commands.Bot):
                 qty=qty,
                 price=order_price,
                 maker_offset_bps=maker_offset_bps,
+                maker_aggressive_ticks=maker_aggressive_ticks,
             )
             drafts.append(draft)
             entry_price = item.get("entryPrice", "n/a")
@@ -10940,6 +13212,7 @@ class BacktestBot(commands.Bot):
             price = current_price
 
         maker_offset_bps = float(cfg.get("maker_offset_bps", 1.0) or 0.0)
+        maker_aggressive_ticks = int(cfg.get("maker_aggressive_ticks", 0) or 0)
         order_price = self._apply_maker_offset(price, side, maker_offset_bps)
 
         tick_size = 0.0
@@ -10957,6 +13230,9 @@ class BacktestBot(commands.Bot):
             )
         except Exception:
             pass
+        order_price = self._apply_maker_aggressive_ticks(
+            order_price, side, tick_size, maker_aggressive_ticks
+        )
 
         raw_order_price = order_price
         order_price = RealtimeRunner._round_price_with_bounds(
@@ -11001,6 +13277,7 @@ class BacktestBot(commands.Bot):
             qty=qty,
             reduce_only=False,
             maker_offset_bps=maker_offset_bps,
+            maker_aggressive_ticks=maker_aggressive_ticks,
         )
 
         warnings: List[str] = []
@@ -11036,6 +13313,7 @@ class BacktestBot(commands.Bot):
             f"- Notional (USDT): {notional:,.2f}\n"
             f"- Qty: {qty:.6g}\n"
             f"- Order price (maker): {self._fmt_price(order_price)}\n"
+            f"- Maker aggressive ticks: {maker_aggressive_ticks}\n"
             f"- Current price: {price_text}\n"
             f"- Available USDT: {available_text} (wallet {wallet_text})\n"
             "- Margin: ISOLATED\n"
@@ -11064,6 +13342,241 @@ class BacktestBot(commands.Bot):
         tokens = shlex.split(args or "")
         if tokens:
             first = tokens[0].lower()
+            if first in {"graph", "chart", "snapshot"}:
+                await self._send_realtime_entry_chart(ctx, group)
+                return
+            if first in {"apply_backtest", "applybt", "bt", "backtest"}:
+                if not self._is_guild_owner_ctx(ctx):
+                    await ctx.reply("Only the server owner can apply backtest settings.")
+                    return
+                applied, summary = self._apply_backtest_settings_to_realtime(group)
+                runner = self._runner_for_group(group)
+                running = bool(runner and getattr(runner, "is_running", lambda: False)())
+                if running:
+                    self._stop_realtime_runner(group)
+                    err = self._start_realtime_runner(group)
+                    if err:
+                        await ctx.reply(
+                            f"{group} 설정을 적용했지만 재시작 실패: {err}"
+                        )
+                        return
+                backtest_count = len(summary.get("backtest_keys", []))
+                strategy_count = len(summary.get("strategy_params_keys", []))
+                data_count = len(summary.get("data_keys", []))
+                summary_parts = [
+                    f"backtest {backtest_count}",
+                    f"strategy params {strategy_count}",
+                    f"data {data_count}",
+                ]
+                if summary.get("strategy_name"):
+                    summary_parts.append(f"strategy_name {summary['strategy_name']}")
+                applied_keys = ", ".join(summary_parts) if applied else "none"
+                restart_note = " (runner 재시작 완료)" if running else " (다음 시작부터 적용)"
+                await ctx.reply(
+                    f"{group} 설정을 backtest 기준으로 맞췄어요.{restart_note}\n"
+                    f"Applied: {applied_keys}"
+                )
+                return
+            if first == "setting":
+                if not self._is_guild_owner_ctx(ctx):
+                    await ctx.reply("Only the server owner can change settings.")
+                    return
+                if len(tokens) == 1:
+                    await ctx.reply(
+                        f"Usage: `!{group} setting show [name]`, "
+                        f"`!{group} setting look`, `!{group} setting list`, "
+                        f"`!{group} setting save`, `!{group} setting apply [name]`, "
+                        f"`!{group} setting upload name`, `!{group} setting download [name]`"
+                    )
+                    return
+                action = tokens[1].lower()
+                if action == "list":
+                    profiles = self._list_realtime_setting_profiles(group)
+                    if not profiles:
+                        await ctx.reply("No saved setting profiles.")
+                        return
+                    lines = []
+                    for name in profiles:
+                        label = self._format_realtime_setting_profile_label(group, name)
+                        updated = self._format_realtime_setting_profile_updated_at(
+                            group, name
+                        )
+                        if updated:
+                            lines.append(f"- {label} (updated {updated})")
+                        else:
+                            lines.append(f"- {label}")
+                    await ctx.reply("Saved profiles:\n" + "\n".join(lines))
+                    return
+                if action == "save":
+                    view = RealtimeSettingSaveChoiceView(self, group, ctx.author.id)
+                    message = await ctx.reply(
+                        f"Save current {group} settings: choose new or overwrite.",
+                        view=view,
+                    )
+                    view.message = message
+                    return
+                if action == "upload":
+                    if len(tokens) < 3:
+                        await ctx.reply(f"Usage: `!{group} setting upload profile_name`")
+                        return
+                    if not ctx.message.attachments:
+                        await ctx.reply(
+                            f"Attach a YAML file and use `!{group} setting upload profile_name`."
+                        )
+                        return
+                    name = tokens[2]
+                    attachment = ctx.message.attachments[0]
+                    try:
+                        raw_bytes = await attachment.read()
+                        raw_text = raw_bytes.decode("utf-8")
+                    except Exception:
+                        await ctx.reply("Failed to read attachment (expecting UTF-8 text).")
+                        return
+                    try:
+                        parsed = yaml.safe_load(raw_text)
+                    except Exception:
+                        await ctx.reply("Failed to parse YAML from attachment.")
+                        return
+                    if not isinstance(parsed, dict):
+                        await ctx.reply("Uploaded YAML must be a mapping.")
+                        return
+                    if "realtime" in parsed:
+                        realtime = parsed.get("realtime")
+                        if not isinstance(realtime, dict):
+                            await ctx.reply("Uploaded YAML has invalid `realtime` section.")
+                            return
+                        profile = copy.deepcopy(parsed)
+                    else:
+                        profile = {"realtime": parsed}
+                    meta = profile.get("meta")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta["name"] = name
+                    meta["saved_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    profile["meta"] = meta
+                    path = self._realtime_setting_profile_path(group, name)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+                    await ctx.reply(f"Uploaded {group} settings profile `{path.name}`.")
+                    return
+                if action == "download":
+                    profile = None
+                    label = f"{group}_settings"
+                    if len(tokens) >= 3:
+                        name = tokens[2]
+                        profile = self._load_realtime_setting_profile(group, name)
+                        if profile is None:
+                            await ctx.reply("Profile not found.")
+                            return
+                        label = f"{group}_settings_{name}"
+                    else:
+                        profile = self._current_realtime_settings_payload(group)
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        suffix=".yaml",
+                        delete=False,
+                        encoding="utf-8",
+                    ) as tmp:
+                        tmp.write(yaml.safe_dump(profile, sort_keys=False))
+                        tmp_path = Path(tmp.name)
+                    try:
+                        await ctx.reply(files=[discord.File(tmp_path, filename=f"{label}.yaml")])
+                    finally:
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+                    return
+                if action == "apply":
+                    profiles = self._list_realtime_setting_profiles(group)
+                    if not profiles:
+                        await ctx.reply("No saved setting profiles.")
+                        return
+                    if len(tokens) >= 3:
+                        name = tokens[2]
+                        ok, message = await self._apply_realtime_setting_profile(
+                            group, name
+                        )
+                        await ctx.reply(message)
+                        return
+                    view = RealtimeSettingApplyView(
+                        self, group, profiles, ctx.author.id
+                    )
+                    message = await ctx.reply(
+                        "Select a profile to apply.",
+                        view=view,
+                    )
+                    view.message = message
+                    return
+                if action == "look":
+                    profiles = self._list_realtime_setting_profiles(group)
+                    if not profiles:
+                        await ctx.reply("No saved setting profiles.")
+                        return
+                    view = RealtimeSettingLookView(
+                        self, group, profiles, ctx.author.id
+                    )
+                    message = await ctx.reply(
+                        "Select a profile to preview.",
+                        view=view,
+                    )
+                    view.message = message
+                    return
+                if action == "show":
+                    if len(tokens) >= 3:
+                        profile = self._load_realtime_setting_profile(group, tokens[2])
+                        if profile is None:
+                            await ctx.reply("Profile not found.")
+                            return
+                        redacted = self._redact_realtime_profile_for_display(
+                            group, profile
+                        )
+                        lines = self._build_realtime_profile_preview_lines(
+                            group, tokens[2], redacted
+                        )
+                        view = TextPagerView(
+                            f"{group.upper()} settings profile: {tokens[2]}",
+                            lines,
+                            page_size=30,
+                            code_block="yaml",
+                        )
+                        message = await ctx.reply(view.page_content(), view=view)
+                        view.message = message
+                        return
+                    current_applied = self._find_current_realtime_applied_profile(group)
+                    if current_applied:
+                        header = f"Current applied profile: {current_applied}"
+                    else:
+                        header = (
+                            "Current applied profile: none "
+                            "(current settings do not match any saved profile)."
+                        )
+                    payload = self._current_realtime_settings_payload(group)
+                    redacted = self._redact_realtime_profile_for_display(
+                        group, payload
+                    )
+                    lines = [header, ""] + yaml.safe_dump(
+                        redacted, sort_keys=False
+                    ).splitlines()
+                    view = TextPagerView(
+                        f"Current {group} settings",
+                        lines,
+                        page_size=30,
+                        code_block="yaml",
+                    )
+                    message = await ctx.reply(view.page_content(), view=view)
+                    view.message = message
+                    return
+                await ctx.reply(
+                    "Unknown action. Use `show`, `look`, `list`, `save`, `upload`, `download`, or `apply`."
+                )
+                return
+            if first in {"check", "health", "apicheck", "api_check", "diagnose"}:
+                if group != "live":
+                    await ctx.reply("API 체크는 live에서만 지원돼요.")
+                    return
+                await self._run_live_api_check(ctx)
+                return
             if first in {"api", "apikey", "api_key", "key", "secret", "apisecret", "api_secret", "credentials", "creds"}:
                 if group != "live":
                     await ctx.reply("API 키/시크릿 설정은 live에서만 지원돼요.")
@@ -11237,8 +13750,8 @@ class BacktestBot(commands.Bot):
         action = self._parse_realtime_action(args or "")
         if action is None:
             await ctx.reply(
-                "Usage: `!sim on|off|status|restart|asset|interval|symbol` "
-                "or `!live on|off|status|restart|api|interval|symbol`"
+                "Usage: `!sim on|off|status|restart|asset|interval|symbol|apply_backtest|graph` "
+                "or `!live on|off|status|restart|api|interval|symbol|check|apply_backtest|graph`"
             )
             return
 
@@ -11254,10 +13767,16 @@ class BacktestBot(commands.Bot):
             symbol = str(cfg.get("symbol", "") or "").upper() or "UNKNOWN"
             interval = str(cfg.get("interval", "") or "")
             auto_trade = bool(cfg.get("auto_trade", False))
+            if group != "live":
+                auto_trade = False
+            elif running:
+                auto_trade = True
             maker_offset = cfg.get("maker_offset_bps", "n/a")
+            maker_aggressive = cfg.get("maker_aggressive_ticks", "n/a")
             await ctx.reply(
                 f"{group.upper()} 상태: enabled={enabled} | running={running} | "
-                f"auto_trade={auto_trade} | {symbol} {interval} | maker_offset_bps={maker_offset}"
+                f"auto_trade={auto_trade} | {symbol} {interval} | "
+                f"maker_offset_bps={maker_offset} | maker_aggressive_ticks={maker_aggressive}"
             )
             return
 
@@ -11332,6 +13851,82 @@ class BacktestBot(commands.Bot):
             label = f"{label} [{name}]"
         return label
 
+    def _realtime_setting_profiles_dir(self, group: str) -> Path:
+        return (
+            self.sim_setting_profiles_dir
+            if group == "sim"
+            else self.live_setting_profiles_dir
+        )
+
+    def _realtime_setting_profile_path(self, group: str, name: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", name.strip())
+        if not safe:
+            safe = "profile"
+        if not safe.endswith(".yaml") and not safe.endswith(".yml"):
+            safe += ".yaml"
+        return self._realtime_setting_profiles_dir(group) / safe
+
+    def _load_realtime_setting_profile(
+        self, group: str, name: str
+    ) -> Optional[Dict[str, Any]]:
+        path = self._realtime_setting_profile_path(group, name)
+        if not path.exists():
+            return None
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        return raw
+
+    def _list_realtime_setting_profiles(self, group: str) -> List[str]:
+        folder = self._realtime_setting_profiles_dir(group)
+        folder.mkdir(parents=True, exist_ok=True)
+        return sorted(p.name for p in folder.glob("*.y*ml") if p.is_file())
+
+    def _format_realtime_setting_profile_label(self, group: str, name: str) -> str:
+        profile = self._load_realtime_setting_profile(group, name)
+        display = name
+        description = None
+        if isinstance(profile, dict):
+            meta = profile.get("meta")
+            if isinstance(meta, dict):
+                meta_name = meta.get("name")
+                meta_description = meta.get("description")
+                if isinstance(meta_name, str) and meta_name.strip():
+                    display = meta_name.strip()
+                if isinstance(meta_description, str) and meta_description.strip():
+                    description = meta_description.strip()
+        label = display
+        if description:
+            label = f"{label} ({description})"
+        if display != name:
+            label = f"{label} [{name}]"
+        return label
+
+    def _format_realtime_setting_profile_updated_at(
+        self, group: str, name: str
+    ) -> Optional[str]:
+        path = self._realtime_setting_profile_path(group, name)
+        if not path.exists():
+            return None
+        profile = self._load_realtime_setting_profile(group, name)
+        saved_at = None
+        if isinstance(profile, dict):
+            meta = profile.get("meta")
+            if isinstance(meta, dict):
+                saved_at = meta.get("saved_at")
+        updated_at: Optional[datetime] = None
+        if isinstance(saved_at, str):
+            updated_at = self._parse_saved_at(saved_at)
+        if updated_at is None:
+            try:
+                updated_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                return None
+        return updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+
     @staticmethod
     def _parse_saved_at(value: str) -> Optional[datetime]:
         text = value.strip()
@@ -11385,6 +13980,203 @@ class BacktestBot(commands.Bot):
             }
         return payload
 
+    @staticmethod
+    def _deep_merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = BacktestBot._deep_merge_dicts(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+
+    def _current_settings_payload(self) -> Dict[str, Any]:
+        return {
+            "data": self.settings.data,
+            "backtest": self.settings.backtest,
+            "strategy": self.settings.strategy,
+        }
+
+    def _build_realtime_settings_payload(
+        self, group: str, name: Optional[str] = None, description: Optional[str] = None
+    ) -> Dict[str, Any]:
+        cfg = copy.deepcopy(self._get_realtime_cfg(group))
+        payload: Dict[str, Any] = {"realtime": cfg}
+        if name or description:
+            payload["meta"] = {
+                "name": name,
+                "description": description,
+                "saved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+        return payload
+
+    def _current_realtime_settings_payload(self, group: str) -> Dict[str, Any]:
+        cfg = self._get_realtime_cfg(group)
+        return {"realtime": cfg}
+
+    def _realtime_profile_matches_current(
+        self, group: str, profile: Dict[str, Any]
+    ) -> bool:
+        realtime = profile.get("realtime")
+        if not isinstance(realtime, dict):
+            return False
+        current = self._current_realtime_settings_payload(group)
+        return realtime == current["realtime"]
+
+    def _find_current_realtime_applied_profile(self, group: str) -> Optional[str]:
+        profiles = self._list_realtime_setting_profiles(group)
+        for name in profiles:
+            profile = self._load_realtime_setting_profile(group, name)
+            if isinstance(profile, dict) and self._realtime_profile_matches_current(
+                group, profile
+            ):
+                return name
+        return None
+
+    @staticmethod
+    def _mask_secret_value(value: str) -> str:
+        if not value:
+            return ""
+        if len(value) <= 6:
+            return value[0] + ("*" * max(len(value) - 2, 1)) + value[-1]
+        return f"{value[:4]}...{value[-4:]}"
+
+    def _redact_realtime_profile_for_display(
+        self, group: str, profile: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if group != "live":
+            return copy.deepcopy(profile)
+        redacted = copy.deepcopy(profile)
+        realtime = redacted.get("realtime")
+        if not isinstance(realtime, dict):
+            return redacted
+        for key in ("api_key", "api_secret"):
+            raw = realtime.get(key)
+            if isinstance(raw, str) and raw:
+                realtime[key] = self._mask_secret_value(raw)
+        return redacted
+
+    def _build_realtime_profile_preview_lines(
+        self, group: str, name: str, profile: Dict[str, Any]
+    ) -> List[str]:
+        current_applied = self._find_current_realtime_applied_profile(group)
+        if current_applied:
+            lines = [
+                f"# Current applied profile: {current_applied}",
+                "",
+            ]
+        else:
+            lines = [
+                "# Current applied profile: none (current settings do not match any saved profile).",
+                "",
+            ]
+        content = yaml.safe_dump(profile, sort_keys=False)
+        lines.extend(content.splitlines())
+        return lines
+
+    def _profile_matches_current(self, profile: Dict[str, Any]) -> bool:
+        data = profile.get("data")
+        backtest = profile.get("backtest")
+        strategy = profile.get("strategy")
+        if not isinstance(data, dict) or not isinstance(backtest, dict) or not isinstance(strategy, dict):
+            return False
+        current = self._current_settings_payload()
+        return (
+            data == current["data"]
+            and backtest == current["backtest"]
+            and strategy == current["strategy"]
+        )
+
+    def _find_current_applied_profile(self) -> Optional[str]:
+        profiles = self._list_setting_profiles()
+        for name in profiles:
+            profile = self._load_setting_profile(name)
+            if isinstance(profile, dict) and self._profile_matches_current(profile):
+                return name
+        return None
+
+    def _build_profile_preview_lines(self, name: str, profile: Dict[str, Any]) -> List[str]:
+        current_applied = self._find_current_applied_profile()
+        if current_applied:
+            lines = [
+                f"# Current applied profile: {current_applied}",
+                "",
+            ]
+        else:
+            lines = [
+                "# Current applied profile: none (current settings do not match any saved profile).",
+                "",
+            ]
+        content = yaml.safe_dump(profile, sort_keys=False)
+        lines.extend(content.splitlines())
+        return lines
+
+    async def _send_setting_profile_preview(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+    ) -> None:
+        profile = self._load_setting_profile(name)
+        if profile is None:
+            await interaction.response.send_message("Profile not found.", ephemeral=True)
+            return
+        lines = self._build_profile_preview_lines(name, profile)
+        view = TextPagerView(
+            f"Settings profile: {name}",
+            lines,
+            page_size=30,
+            code_block="yaml",
+        )
+        try:
+            await interaction.response.send_message(
+                view.page_content(),
+                view=view,
+                ephemeral=True,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                message = await interaction.channel.send(
+                    view.page_content(),
+                    view=view,
+                )
+                view.message = message
+                return
+        view.message = await interaction.original_response()
+
+    async def _send_realtime_setting_profile_preview(
+        self,
+        interaction: discord.Interaction,
+        group: str,
+        name: str,
+    ) -> None:
+        profile = self._load_realtime_setting_profile(group, name)
+        if profile is None:
+            await interaction.response.send_message("Profile not found.", ephemeral=True)
+            return
+        redacted = self._redact_realtime_profile_for_display(group, profile)
+        lines = self._build_realtime_profile_preview_lines(group, name, redacted)
+        view = TextPagerView(
+            f"{group.upper()} settings profile: {name}",
+            lines,
+            page_size=30,
+            code_block="yaml",
+        )
+        try:
+            await interaction.response.send_message(
+                view.page_content(),
+                view=view,
+                ephemeral=True,
+            )
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                message = await interaction.channel.send(
+                    view.page_content(),
+                    view=view,
+                )
+                view.message = message
+                return
+        view.message = await interaction.original_response()
+
     def _save_setting_profile(
         self,
         name: str,
@@ -11399,6 +14191,23 @@ class BacktestBot(commands.Bot):
         path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
         return path, None
 
+    def _save_realtime_setting_profile(
+        self,
+        group: str,
+        name: str,
+        description: Optional[str],
+        overwrite: bool,
+    ) -> tuple[Optional[Path], Optional[str]]:
+        path = self._realtime_setting_profile_path(group, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not overwrite:
+            return None, "That profile already exists. Use overwrite to replace it."
+        payload = self._build_realtime_settings_payload(
+            group, name=name, description=description
+        )
+        path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+        return path, None
+
     async def _apply_setting_profile(self, name: str) -> tuple[bool, str]:
         profile = self._load_setting_profile(name)
         if profile is None:
@@ -11408,31 +14217,52 @@ class BacktestBot(commands.Bot):
         strategy = profile.get("strategy")
         if not isinstance(data, dict) or not isinstance(backtest, dict) or not isinstance(strategy, dict):
             return False, "Profile is missing required sections (data/backtest/strategy)."
-        self.settings.data = copy.deepcopy(data)
-        self.settings.backtest = copy.deepcopy(backtest)
-        self.settings.strategy = copy.deepcopy(strategy)
+        self.settings.data = self._deep_merge_dicts(self.settings.data, data)
+        self.settings.backtest = self._deep_merge_dicts(self.settings.backtest, backtest)
+        self.settings.strategy = self._deep_merge_dicts(self.settings.strategy, strategy)
+        self._ensure_strategy_param_defaults()
         save_settings(self.settings_path, self.settings)
         await self._update_strategy_list_channel()
+        message = (
+            f"Applied settings profile `{name}`.\n"
+            "Backtest settings only; sim/live runners were not restarted."
+        )
+        return True, message
 
-        restart_lines: List[str] = []
-        for group in ("sim", "live"):
-            runner = self._runner_for_group(group)
-            running = bool(runner and getattr(runner, "is_running", lambda: False)())
-            if not running:
-                continue
+    async def _apply_realtime_setting_profile(
+        self, group: str, name: str
+    ) -> tuple[bool, str]:
+        profile = self._load_realtime_setting_profile(group, name)
+        if profile is None:
+            return False, "Profile not found."
+        realtime = profile.get("realtime")
+        if not isinstance(realtime, dict):
+            return False, "Profile is missing required section (realtime)."
+        key = "sim" if group == "sim" else "live"
+        self.settings.discord[key] = copy.deepcopy(realtime)
+        if group == "sim":
+            self.sim_cfg = self.settings.discord[key]
+        else:
+            self.live_cfg = self.settings.discord[key]
+        save_settings(self.settings_path, self.settings)
+        runner = self._runner_for_group(group)
+        running = bool(runner and getattr(runner, "is_running", lambda: False)())
+        if running:
             self._stop_realtime_runner(group)
             err = self._start_realtime_runner(group)
             if err:
-                restart_lines.append(f"{group} restart failed: {err}")
-            else:
-                restart_lines.append(f"{group} runner restarted.")
-
-        message = f"Applied settings profile `{name}`."
-        if restart_lines:
-            message = message + "\n" + "\n".join(restart_lines)
-        else:
-            message = message + "\nNo runners were running; changes apply on next start."
-        return True, message
+                return (
+                    False,
+                    f"Applied {group} settings profile `{name}`, but restart failed: {err}",
+                )
+            return (
+                True,
+                f"Applied {group} settings profile `{name}`.\n{group} runner restarted.",
+            )
+        return (
+            True,
+            f"Applied {group} settings profile `{name}`.\n{group} runner will use this on next start.",
+        )
 
     async def setting_text(self, ctx: commands.Context, *, args: str = "") -> None:
         if ctx.guild is None:
@@ -11447,7 +14277,7 @@ class BacktestBot(commands.Bot):
         tokens = shlex.split(args) if args else []
         if not tokens:
             await ctx.reply(
-                "Usage: `!setting show [name]`, `!setting edit section.key value`, "
+                "Usage: `!setting show [name]`, `!setting look`, `!setting edit section.key value`, "
                 "`!setting list`, `!setting save`, `!setting apply [name]`, "
                 "`!setting upload name`, "
                 "`!setting download`, `!setting delete name`"
@@ -11490,6 +14320,18 @@ class BacktestBot(commands.Bot):
             view = SettingApplyView(self, profiles, ctx.author.id)
             message = await ctx.reply(
                 "Select a profile to apply.",
+                view=view,
+            )
+            view.message = message
+            return
+        if action == "look":
+            profiles = self._list_setting_profiles()
+            if not profiles:
+                await ctx.reply("No saved setting profiles.")
+                return
+            view = SettingLookView(self, profiles, ctx.author.id)
+            message = await ctx.reply(
+                "Select a profile to preview.",
                 view=view,
             )
             view.message = message
@@ -11546,8 +14388,7 @@ class BacktestBot(commands.Bot):
                 if profile is None:
                     await ctx.reply("Profile not found.")
                     return
-                content = yaml.safe_dump(profile, sort_keys=False)
-                lines = content.splitlines()
+                lines = self._build_profile_preview_lines(tokens[1], profile)
                 view = TextPagerView(
                     f"Settings profile: {tokens[1]}",
                     lines,
@@ -11557,8 +14398,13 @@ class BacktestBot(commands.Bot):
                 message = await ctx.reply(view.page_content(), view=view)
                 view.message = message
                 return
+            current_applied = self._find_current_applied_profile()
             entries = self._flatten_settings()
-            lines = [f"- {key}: {value}" for key, value in entries]
+            if current_applied:
+                header = f"Current applied profile: {current_applied}"
+            else:
+                header = "Current applied profile: none (current settings do not match any saved profile)."
+            lines = [header, ""] + [f"- {key}: {value}" for key, value in entries]
             view = TextPagerView("Current settings", lines, page_size=30)
             message = await ctx.reply(view.page_content(), view=view)
             view.message = message
@@ -11597,7 +14443,7 @@ class BacktestBot(commands.Bot):
             await self._update_strategy_list_channel()
             return
         await ctx.reply(
-            "Unknown action. Use `show`, `edit`, `list`, `save`, "
+            "Unknown action. Use `show`, `look`, `edit`, `list`, `save`, "
             "`apply`, `upload`, `download`, or `delete`."
         )
 
@@ -11614,6 +14460,7 @@ class BacktestBot(commands.Bot):
             "",
             "Backtest",
             "- `!testrun [options]` : Run backtest (see prompt for options).",
+            "- `!recent` : Backtest last 5 days and post trade charts.",
             "- `!diff [options]` : Compare entry diff.",
             "- `!grid [options]` : Grid search.",
             "- `!comp [options]` : Compare strategies.",
@@ -11633,6 +14480,7 @@ class BacktestBot(commands.Bot):
             "",
             "Settings",
             "- `!setting show [name]` : Show current or saved profile.",
+            "- `!setting look` : Preview a saved profile from a list.",
             "- `!setting edit section.key value` : Edit a setting.",
             "- `!setting list` : List profiles.",
             "- `!setting save` : Save profile (new/overwrite).",
@@ -11645,7 +14493,7 @@ class BacktestBot(commands.Bot):
             "- `!status` : Post status embed to sim/live status channels.",
             "",
             "Realtime charts",
-            "- `!graph` : Chart from entry to now for active positions.",
+            "- `!graph` : Entry→now chart + lookback extreme→entry chart (if configured).",
             "",
             "Fun",
             "- `!wordle` : Start a 5-letter wordle game in the chat channel.",
@@ -11656,6 +14504,15 @@ class BacktestBot(commands.Bot):
             "- `!sim asset [amount]` : View/set sim initial balance.",
             "- `!sim interval [5m]` : View/set sim interval.",
             "- `!sim symbol [XRPUSDT]` : View/set sim symbol.",
+            "- `!sim apply_backtest` : Copy backtest/strategy/data settings into sim.",
+            "- `!sim setting show [name]` : Show current or saved sim profile.",
+            "- `!sim setting list` : List sim profiles.",
+            "- `!sim setting save` : Save sim profile (new/overwrite).",
+            "- `!sim setting upload name` : Upload sim profile from YAML attachment.",
+            "- `!sim setting download [name]` : Download current or named sim profile.",
+            "- `!sim setting apply [name]` : Apply sim profile (restarts runner).",
+            "- `!sim setting look` : Preview a saved sim profile.",
+            "- `!sim graph` : Entry→now chart + lookback extreme→entry chart (if configured).",
             "",
             "Realtime (live)",
             "- `!live on|off|restart|status` : Control live runner.",
@@ -11664,7 +14521,19 @@ class BacktestBot(commands.Bot):
             "- `!live apisecret [SECRET]` : Set API secret only.",
             "- `!live interval [5m]` : View/set live interval.",
             "- `!live symbol [BTCUSDT]` : View/set live symbol.",
+            "- `!live check` : Verify API connectivity and test buy/sell orders (no execution).",
+            "- `!live apply_backtest` : Copy backtest/strategy/data settings into live.",
+            "- `!live setting show [name]` : Show current or saved live profile.",
+            "- `!live setting list` : List live profiles.",
+            "- `!live setting save` : Save live profile (new/overwrite).",
+            "- `!live setting upload name` : Upload live profile from YAML attachment.",
+            "- `!live setting download [name]` : Download current or named live profile.",
+            "- `!live setting apply [name]` : Apply live profile (restarts runner).",
+            "- `!live setting look` : Preview a saved live profile.",
+            "- `!live graph` : Entry→now chart + lookback extreme→entry chart (if configured).",
             "- `!order buy|sell qty [price] [symbol] [leverage] [reduce]` : Place live order.",
+            "- `!livetest buy|sell|close [args]` : Place live test entry/close order (live runner path).",
+            "- `!closetest [long|short] [price]` : Place live test close order (live runner path).",
             "- `!close` : Close an open live position (interactive).",
             "- `!positions` : Show live open futures positions.",
             "- `!assets` : Show futures + spot balances.",
@@ -11962,6 +14831,10 @@ async def backtest_text_command(ctx: commands.Context, *, args: str = "") -> Non
     await _get_backtest_bot(ctx).backtest_text(ctx, args=args)
 
 
+async def recent_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).recent_text(ctx, args=args)
+
+
 async def entry_diff_text_command(ctx: commands.Context, *, args: str = "") -> None:
     await _get_backtest_bot(ctx).entry_diff_text(ctx, args=args)
 
@@ -12055,6 +14928,14 @@ async def sim_text_command(ctx: commands.Context, *, args: str = "") -> None:
 
 async def live_text_command(ctx: commands.Context, *, args: str = "") -> None:
     await _get_backtest_bot(ctx).live_text(ctx, args=args)
+
+
+async def livetest_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).livetest_text(ctx, args=args)
+
+
+async def closetest_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).closetest_text(ctx, args=args)
 
 
 async def order_text_command(ctx: commands.Context, *, args: str = "") -> None:

@@ -62,6 +62,8 @@ class BinanceFuturesClient:
         self.recv_window = recv_window
         self.timeout = timeout
         self._symbol_filters: Dict[str, SymbolFilters] = {}
+        self._time_offset_ms = 0
+        self._time_offset_last_sync = 0.0
 
     def _sign(self, params: list[tuple[str, Any]] | Dict[str, Any]) -> str:
         if isinstance(params, dict):
@@ -74,6 +76,16 @@ class BinanceFuturesClient:
             hashlib.sha256,
         ).hexdigest()
 
+    def _get_timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self._time_offset_ms
+
+    def _sync_time_offset(self) -> None:
+        data = self._request("GET", "/fapi/v1/time")
+        server_ms = int(data.get("serverTime", 0))
+        if server_ms:
+            self._time_offset_ms = server_ms - int(time.time() * 1000)
+            self._time_offset_last_sync = time.monotonic()
+
     def _request(
         self,
         method: str,
@@ -85,8 +97,13 @@ class BinanceFuturesClient:
         headers = {"X-MBX-APIKEY": self.api_key} if self.api_key else {}
         request_params: Dict[str, Any] | list[tuple[str, Any]]
         if signed:
+            if time.monotonic() - self._time_offset_last_sync > 30:
+                try:
+                    self._sync_time_offset()
+                except Exception:
+                    pass
             param_items = list(base_params.items())
-            param_items.append(("timestamp", int(time.time() * 1000)))
+            param_items.append(("timestamp", self._get_timestamp_ms()))
             param_items.append(("recvWindow", self.recv_window))
             signature = self._sign(param_items)
             param_items.append(("signature", signature))
@@ -113,6 +130,12 @@ class BinanceFuturesClient:
                 data = None
             code = data.get("code") if data else None
             msg = data.get("msg") if data else None
+            if signed and code == -1021:
+                try:
+                    self._sync_time_offset()
+                    return self._request(method, path, params=params, signed=signed)
+                except Exception:
+                    pass
             raise BinanceAPIError(
                 resp.status_code, code=code, msg=msg, url=resp.url, response_text=resp.text
             ) from exc
@@ -125,6 +148,12 @@ class BinanceFuturesClient:
             params={"symbol": symbol.upper()},
         )
         return float(data["price"])
+
+    def ping(self) -> Any:
+        return self._request("GET", "/fapi/v1/ping")
+
+    def get_server_time(self) -> Any:
+        return self._request("GET", "/fapi/v1/time")
 
     def get_klines(self, symbol: str, interval: str, limit: int = 2) -> list[list]:
         return self._request(
@@ -256,6 +285,77 @@ class BinanceFuturesClient:
                 params["positionSide"] = side_value
         return self._request("POST", "/fapi/v1/order", params=params, signed=True)
 
+    def place_limit(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,
+        time_in_force: str = "GTC",
+    ) -> Any:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": time_in_force,
+            "quantity": qty,
+            "price": price,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if position_side:
+            side_value = position_side.upper()
+            if side_value in {"LONG", "SHORT"}:
+                params["positionSide"] = side_value
+        return self._request("POST", "/fapi/v1/order", params=params, signed=True)
+
+    def place_market(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,
+    ) -> Any:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "MARKET",
+            "quantity": qty,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if position_side:
+            side_value = position_side.upper()
+            if side_value in {"LONG", "SHORT"}:
+                params["positionSide"] = side_value
+        return self._request("POST", "/fapi/v1/order", params=params, signed=True)
+
+    def place_stop_market_close(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        reduce_only: bool = True,
+        position_side: Optional[str] = None,
+    ) -> Any:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "STOP_MARKET",
+            "stopPrice": stop_price,
+            "closePosition": "true",
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if position_side:
+            side_value = position_side.upper()
+            if side_value in {"LONG", "SHORT"}:
+                params["positionSide"] = side_value
+        return self._request("POST", "/fapi/v1/order", params=params, signed=True)
+
     def get_order(
         self,
         symbol: str,
@@ -285,6 +385,31 @@ class BinanceFuturesClient:
         if orig_client_order_id:
             params["origClientOrderId"] = orig_client_order_id
         return self._request("DELETE", "/fapi/v1/order", params=params, signed=True)
+
+    def test_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        position_side: Optional[str] = None,
+        reduce_only: bool = False,
+    ) -> Any:
+        params = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": qty,
+            "price": price,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        if position_side:
+            side_value = position_side.upper()
+            if side_value in {"LONG", "SHORT"}:
+                params["positionSide"] = side_value
+        return self._request("POST", "/fapi/v1/order/test", params=params, signed=True)
 
 
 class BinanceSpotClient:

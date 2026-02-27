@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Sequence
 import tempfile
 
 import numpy as np
@@ -20,6 +20,70 @@ class EntryDiffConfig:
     min_side_samples: int = 10
     top_features: int = 3
     max_groups: int = 24
+
+
+_INDICATOR_TOKENS = (
+    "rsi",
+    "slope",
+    "ema",
+    "sma",
+    "macd",
+    "adx",
+    "atr",
+    "vwap",
+    "stoch",
+    "cci",
+    "mom",
+    "momentum",
+    "roc",
+    "boll",
+    "bb",
+    "keltner",
+    "kama",
+)
+
+
+def _resolve_indicator_columns(
+    data: pd.DataFrame,
+    max_cols: int = 8,
+    include: Optional[Sequence[str]] = None,
+) -> List[str]:
+    if data.empty:
+        return []
+    exclude = {
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    }
+    include_set = {str(item).lower() for item in include} if include else set()
+    candidates: List[str] = []
+    for col in data.columns:
+        col_name = str(col)
+        lower = col_name.lower()
+        if lower in exclude:
+            continue
+        if include_set and lower in include_set:
+            if pd.api.types.is_numeric_dtype(data[col]):
+                candidates.append(col_name)
+            continue
+        if any(token in lower for token in _INDICATOR_TOKENS):
+            if pd.api.types.is_numeric_dtype(data[col]):
+                candidates.append(col_name)
+
+    def _rank(col: str) -> Tuple[int, str]:
+        name = col.lower()
+        idx = len(_INDICATOR_TOKENS)
+        for i, token in enumerate(_INDICATOR_TOKENS):
+            if token in name:
+                idx = i
+                break
+        return idx, name
+
+    deduped = sorted(set(candidates), key=_rank)
+    return deduped[: max(0, int(max_cols))]
 
 
 def _atr_pct(data: pd.DataFrame, window: int = 14) -> pd.Series:
@@ -77,7 +141,11 @@ def _build_exit_trade_summaries(trades: Iterable[Dict[str, Any]]) -> List[Dict[s
     return summaries
 
 
-def build_entry_feature_frame(result: BacktestResult, data: pd.DataFrame) -> pd.DataFrame:
+def build_entry_feature_frame(
+    result: BacktestResult,
+    data: pd.DataFrame,
+    indicator_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     if data.empty:
         return pd.DataFrame()
 
@@ -97,6 +165,7 @@ def build_entry_feature_frame(result: BacktestResult, data: pd.DataFrame) -> pd.
             index_map[ts] = idx
 
     atr_pct = _atr_pct(data)
+    extra_cols = _resolve_indicator_columns(data, include=indicator_cols)
 
     rows: List[Dict[str, Any]] = []
     for summary in summaries:
@@ -127,35 +196,46 @@ def build_entry_feature_frame(result: BacktestResult, data: pd.DataFrame) -> pd.
             if high_price and low_price and high_price != low_price
             else np.nan
         )
-        rows.append(
-            {
-                "exit_reason": summary.get("exit_reason"),
-                "add_count": int(summary.get("add_count", 0)),
-                "pnl": summary.get("pnl"),
-                "return": summary.get("return"),
-                "win": float(summary.get("pnl", 0.0)) > 0.0,
-                "direction": int(summary.get("direction", 0)),
-                "entry_time": entry_ts,
-                "exit_time": exit_ts,
-                "entry_price": summary.get("entry_price"),
-                "entry_reason": summary.get("entry_reason"),
-                "open": open_price,
-                "high": high_price,
-                "low": low_price,
-                "close": close_price,
-                "volume": volume,
-                "candle_return_pct": candle_return,
-                "range_pct": range_pct,
-                "body_pct": body_pct,
-                "upper_wick_pct": upper_wick,
-                "lower_wick_pct": lower_wick,
-                "close_pos": close_pos,
-                "atr_pct": float(atr_pct.iloc[idx]) if not atr_pct.empty else np.nan,
-                "hour": int(entry_ts.hour),
-                "minute": int(entry_ts.minute),
-                "weekday": int(entry_ts.weekday()),
-            }
-        )
+        row_payload = {
+            "exit_reason": summary.get("exit_reason"),
+            "add_count": int(summary.get("add_count", 0)),
+            "pnl": summary.get("pnl"),
+            "return": summary.get("return"),
+            "win": float(summary.get("pnl", 0.0)) > 0.0,
+            "direction": int(summary.get("direction", 0)),
+            "entry_time": entry_ts,
+            "exit_time": exit_ts,
+            "entry_price": summary.get("entry_price"),
+            "entry_reason": summary.get("entry_reason"),
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": volume,
+            "candle_return_pct": candle_return,
+            "range_pct": range_pct,
+            "body_pct": body_pct,
+            "upper_wick_pct": upper_wick,
+            "lower_wick_pct": lower_wick,
+            "close_pos": close_pos,
+            "atr_pct": float(atr_pct.iloc[idx]) if not atr_pct.empty else np.nan,
+            "hour": int(entry_ts.hour),
+            "minute": int(entry_ts.minute),
+            "weekday": int(entry_ts.weekday()),
+        }
+        if extra_cols:
+            for col in extra_cols:
+                if col in row_payload:
+                    continue
+                raw = row.get(col, np.nan)
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    value = np.nan
+                if not np.isfinite(value):
+                    value = np.nan
+                row_payload[col] = value
+        rows.append(row_payload)
 
     return pd.DataFrame(rows)
 

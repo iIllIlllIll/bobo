@@ -631,6 +631,22 @@ def _is_tp_reason(reason: Any) -> bool:
     return "take_profit" in text or "rr_tp" in text
 
 
+def _is_slope_reason(reason: Any) -> bool:
+    if reason is None:
+        return False
+    text = str(reason).lower()
+    return "slope" in text
+
+
+def _is_sl_reason(reason: Any) -> bool:
+    if reason is None:
+        return False
+    text = str(reason).lower()
+    if "slope" in text:
+        return False
+    return "stop" in text or text == "sl" or "sl_" in text or "_sl" in text
+
+
 def compute_entry_minute_tp_rate(
     result: BacktestResult,
 ) -> tuple[pd.DataFrame, dict]:
@@ -709,6 +725,704 @@ def compute_entry_minute_tp_rate(
     return minute_df, stats
 
 
+def compute_tp_hit_rate(result: BacktestResult) -> dict[str, float]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    total_exit_trades = int(len(exit_trades))
+    tp_hits = int(
+        sum(1 for trade in exit_trades if _is_tp_reason(trade.get("exit_reason")))
+    )
+    tp_rate = (
+        float(tp_hits) / float(total_exit_trades) * 100.0 if total_exit_trades > 0 else 0.0
+    )
+    return {
+        "trades": total_exit_trades,
+        "tp_hits": tp_hits,
+        "tp_rate": tp_rate,
+    }
+
+
+def compute_tp_target_win_rate(
+    result: BacktestResult,
+    bin_size: float = 5.0,
+) -> tuple[pd.DataFrame, dict]:
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(number):
+            return None
+        return number
+
+    try:
+        bin_size = float(bin_size)
+    except (TypeError, ValueError):
+        bin_size = 5.0
+    if bin_size <= 0:
+        bin_size = 5.0
+
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_price = _coerce_float(trade.get("entry_price"))
+        tp_price = _coerce_float(
+            trade.get("rr_tp_price", trade.get("tp_price", trade.get("tp")))
+        )
+        direction = trade.get("direction")
+        try:
+            direction_value = int(direction)
+        except (TypeError, ValueError):
+            direction_value = 0
+        leverage = _coerce_float(trade.get("leverage")) or 1.0
+        pnl = _coerce_float(trade.get("pnl"))
+        if entry_price is None or tp_price is None:
+            continue
+        if entry_price <= 0 or direction_value == 0:
+            continue
+        target_pct = ((tp_price - entry_price) / entry_price) * direction_value * leverage * 100.0
+        if not np.isfinite(target_pct) or target_pct <= 0:
+            continue
+        win = pnl is not None and pnl > 0
+        rows.append({"target_pct": target_pct, "win": win})
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=[
+                "bucket_start",
+                "bucket_end",
+                "label",
+                "wins",
+                "losses",
+                "total",
+                "win_rate",
+                "avg_target",
+            ]
+        )
+        return empty_df, {
+            "trades": int(len(exit_trades)),
+            "trades_with_target": 0,
+            "bin_size": bin_size,
+            "buckets": 0,
+        }
+
+    df = pd.DataFrame(rows)
+    df["bucket_start"] = np.floor(df["target_pct"] / bin_size) * bin_size
+    df["bucket_end"] = df["bucket_start"] + bin_size
+
+    def _fmt_bin(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    grouped = df.groupby("bucket_start", sort=True)
+    out_rows: list[dict[str, Any]] = []
+    for start, group in grouped:
+        total = int(len(group))
+        wins = int(group["win"].sum())
+        losses = total - wins
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+        avg_target = float(group["target_pct"].mean()) if total > 0 else 0.0
+        end = float(start) + bin_size
+        out_rows.append(
+            {
+                "bucket_start": float(start),
+                "bucket_end": end,
+                "label": f"{_fmt_bin(float(start))}-{_fmt_bin(end)}",
+                "wins": wins,
+                "losses": losses,
+                "total": total,
+                "win_rate": win_rate,
+                "avg_target": avg_target,
+            }
+        )
+
+    bucket_df = pd.DataFrame(out_rows).sort_values("bucket_start")
+    stats = {
+        "trades": int(len(exit_trades)),
+        "trades_with_target": int(len(df)),
+        "bin_size": bin_size,
+        "buckets": int(len(bucket_df)),
+    }
+    return bucket_df, stats
+
+
+def compute_sl_target_win_rate(
+    result: BacktestResult,
+    bin_size: float = 5.0,
+) -> tuple[pd.DataFrame, dict]:
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(number):
+            return None
+        return number
+
+    try:
+        bin_size = float(bin_size)
+    except (TypeError, ValueError):
+        bin_size = 5.0
+    if bin_size <= 0:
+        bin_size = 5.0
+
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_price = _coerce_float(trade.get("entry_price"))
+        sl_price = _coerce_float(
+            trade.get(
+                "rr_stop_price",
+                trade.get("stop_price", trade.get("sl_price", trade.get("sl"))),
+            )
+        )
+        leverage = _coerce_float(trade.get("leverage")) or 1.0
+        pnl = _coerce_float(trade.get("pnl"))
+        if entry_price is None or sl_price is None:
+            continue
+        if entry_price <= 0:
+            continue
+        target_pct = abs((sl_price - entry_price) / entry_price) * leverage * 100.0
+        if not np.isfinite(target_pct) or target_pct <= 0:
+            continue
+        win = pnl is not None and pnl > 0
+        rows.append({"target_pct": target_pct, "win": win})
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=[
+                "bucket_start",
+                "bucket_end",
+                "label",
+                "wins",
+                "losses",
+                "total",
+                "win_rate",
+                "avg_target",
+            ]
+        )
+        return empty_df, {
+            "trades": int(len(exit_trades)),
+            "trades_with_target": 0,
+            "bin_size": bin_size,
+            "buckets": 0,
+        }
+
+    df = pd.DataFrame(rows)
+    df["bucket_start"] = np.floor(df["target_pct"] / bin_size) * bin_size
+    df["bucket_end"] = df["bucket_start"] + bin_size
+
+    def _fmt_bin(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    grouped = df.groupby("bucket_start", sort=True)
+    out_rows: list[dict[str, Any]] = []
+    for start, group in grouped:
+        total = int(len(group))
+        wins = int(group["win"].sum())
+        losses = total - wins
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+        avg_target = float(group["target_pct"].mean()) if total > 0 else 0.0
+        end = float(start) + bin_size
+        out_rows.append(
+            {
+                "bucket_start": float(start),
+                "bucket_end": end,
+                "label": f"{_fmt_bin(float(start))}-{_fmt_bin(end)}",
+                "wins": wins,
+                "losses": losses,
+                "total": total,
+                "win_rate": win_rate,
+                "avg_target": avg_target,
+            }
+        )
+
+    bucket_df = pd.DataFrame(out_rows).sort_values("bucket_start")
+    stats = {
+        "trades": int(len(exit_trades)),
+        "trades_with_target": int(len(df)),
+        "bin_size": bin_size,
+        "buckets": int(len(bucket_df)),
+    }
+    return bucket_df, stats
+
+
+def compute_entry_hour_exit_reason_group_distribution(
+    result: BacktestResult,
+    groups: Optional[Sequence[str]] = None,
+) -> tuple[pd.DataFrame, dict]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    total_exit_trades = int(len(exit_trades))
+    rows: list[dict[str, Any]] = []
+    group_totals: dict[str, int] = {}
+    order = [str(item).lower() for item in (groups or ("tp", "sl", "slopeexit"))]
+
+    def _classify(reason: Any) -> Optional[str]:
+        if _is_slope_reason(reason):
+            return "slopeexit"
+        if _is_tp_reason(reason):
+            return "tp"
+        if _is_sl_reason(reason):
+            return "sl"
+        return None
+
+    for trade in exit_trades:
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            continue
+        ts = pd.to_datetime(entry_time, errors="coerce")
+        if pd.isna(ts):
+            continue
+        if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+        reason = trade.get("exit_reason")
+        group = _classify(reason)
+        if group is None:
+            continue
+        hour = int(ts.hour)
+        rows.append({"hour": hour, "exit_group": group})
+        group_totals[group] = group_totals.get(group, 0) + 1
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=["hour", "label", "exit_group", "count", "total_group", "rate"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "groups": 0,
+            "group_totals": {},
+            "group_order": order,
+        }
+
+    df = pd.DataFrame(rows)
+    grouped = (
+        df.groupby(["exit_group", "hour"], sort=True)
+        .size()
+        .reset_index(name="count")
+    )
+    grouped["total_group"] = grouped["exit_group"].map(group_totals).astype(int)
+    grouped["rate"] = (
+        grouped["count"].astype(float) / grouped["total_group"].astype(float) * 100.0
+    )
+    grouped["label"] = grouped["hour"].apply(lambda value: f"{int(value):02d}")
+    stats = {
+        "trades": total_exit_trades,
+        "trades_with_time": int(len(df)),
+        "groups": int(len(group_totals)),
+        "group_totals": group_totals,
+        "group_order": order,
+    }
+    return grouped, stats
+
+
+def create_entry_hour_exit_reason_group_chart(
+    result: BacktestResult,
+    output_path: Path,
+    title: Optional[str] = None,
+    groups: Optional[Sequence[str]] = None,
+) -> Optional[Path]:
+    hour_df, stats = compute_entry_hour_exit_reason_group_distribution(
+        result, groups=groups
+    )
+    if hour_df.empty:
+        return None
+
+    group_totals = stats.get("group_totals") or {}
+    if not group_totals:
+        return None
+
+    order = stats.get("group_order") or []
+    groups_sorted = [g for g in order if g in group_totals] + [
+        g for g in group_totals.keys() if g not in order
+    ]
+    if not groups_sorted:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hours = list(range(24))
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+    color_cycle = plt.cm.Set2.colors
+
+    for idx, group in enumerate(groups_sorted):
+        sub = hour_df[hour_df["exit_group"] == group]
+        rate_map = {int(row["hour"]): float(row["rate"]) for _, row in sub.iterrows()}
+        rates = [rate_map.get(hour, 0.0) for hour in hours]
+        color = color_cycle[idx % len(color_cycle)]
+        total = int(group_totals.get(group, 0) or 0)
+        ax.plot(
+            hours,
+            rates,
+            marker="o",
+            linewidth=1.6,
+            markersize=3.5,
+            label=f"{group} (n={total})",
+            color=color,
+        )
+
+    ax.set_title(title or "Entry hour by exit group (TP/SL/Slopeexit)")
+    ax.set_xlabel("Entry hour (0-23)")
+    ax.set_ylabel("Share within exit group (%)")
+    ax.set_ylim(0, 100)
+    ax.set_xticks(list(range(0, 24, 2)))
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8, frameon=True)
+
+    trades = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_time", 0) or 0)
+    groups_count = int(stats.get("groups", 0) or 0)
+    stats_lines = [
+        f"Trades  {trades} (cov {covered})",
+        f"Groups  {groups_count}",
+        f"Shown   {len(groups_sorted)}",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+_ENTRY_INDICATOR_TOKENS = (
+    "rsi",
+    "slope",
+    "ema",
+    "sma",
+    "macd",
+    "adx",
+    "atr",
+    "vwap",
+    "stoch",
+    "cci",
+    "mom",
+    "momentum",
+    "roc",
+    "boll",
+    "bb",
+    "keltner",
+    "kama",
+)
+
+
+def _select_entry_indicator_features(
+    frame: pd.DataFrame,
+    max_features: int,
+) -> list[str]:
+    if frame.empty:
+        return []
+    exclude = {
+        "hour",
+        "minute",
+        "weekday",
+        "direction",
+        "pnl",
+        "return",
+        "win",
+        "add_count",
+    }
+    numeric_cols = [
+        col
+        for col in frame.columns
+        if col not in exclude and pd.api.types.is_numeric_dtype(frame[col])
+    ]
+    selected: list[str] = []
+    if "entry_price" in numeric_cols:
+        selected.append("entry_price")
+    remaining = [col for col in numeric_cols if col not in selected]
+
+    def _rank(col: str) -> tuple[int, str]:
+        name = col.lower()
+        idx = len(_ENTRY_INDICATOR_TOKENS)
+        for i, token in enumerate(_ENTRY_INDICATOR_TOKENS):
+            if token in name:
+                idx = i
+                break
+        return idx, name
+
+    indicator_cols = [col for col in remaining if any(token in col.lower() for token in _ENTRY_INDICATOR_TOKENS)]
+    indicator_cols = sorted(indicator_cols, key=_rank)
+    selected.extend(indicator_cols)
+
+    if len(selected) < max_features:
+        fallback = [
+            "atr_pct",
+            "candle_return_pct",
+            "range_pct",
+            "body_pct",
+            "close_pos",
+            "volume",
+        ]
+        for col in fallback:
+            if col in remaining and col not in selected:
+                selected.append(col)
+            if len(selected) >= max_features:
+                break
+
+    return selected[: max(1, int(max_features))]
+
+
+def _format_entry_feature_value(feature: str, value: float) -> str:
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    if feature.endswith("_pct"):
+        return _format_pct(float(value))
+    abs_val = abs(float(value))
+    if abs_val >= 1000:
+        return f"{value:.0f}"
+    if abs_val >= 100:
+        return f"{value:.1f}"
+    if abs_val >= 1:
+        return f"{value:.2f}"
+    return f"{value:.3f}"
+
+
+def create_exit_reason_entry_feature_mean_chart(
+    frame: pd.DataFrame,
+    output_path: Path,
+    title: Optional[str] = None,
+    max_features: int = 6,
+    min_samples: int = 5,
+) -> Optional[Path]:
+    if frame.empty or "exit_reason" not in frame.columns:
+        return None
+    features = _select_entry_indicator_features(frame, max_features=max_features)
+    if not features:
+        return None
+
+    work = frame.dropna(subset=["exit_reason"]).copy()
+    if work.empty:
+        return None
+
+    grouped = work.groupby("exit_reason", dropna=False)
+    counts = grouped.size().sort_values(ascending=False)
+    counts = counts[counts >= min_samples]
+    if counts.empty:
+        return None
+    reasons = counts.index.tolist()
+
+    means = grouped[features].mean(numeric_only=True)
+    means = means.loc[reasons]
+    if means.empty:
+        return None
+
+    zscores = means.copy()
+    for col in means.columns:
+        col_vals = means[col].astype(float)
+        std = float(col_vals.std(ddof=0))
+        if std == 0 or not np.isfinite(std):
+            zscores[col] = 0.0
+        else:
+            zscores[col] = (col_vals - float(col_vals.mean())) / std
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig_width = max(8.5, 1.3 * len(features))
+    fig_height = max(4.0, 0.6 * len(reasons))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    matrix = zscores.to_numpy(dtype=float)
+    im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r")
+    ax.set_title(title or "Entry feature means by exit reason (color=zscore)")
+    ax.set_xlabel("Entry feature")
+    ax.set_ylabel("Exit reason")
+    ax.set_xticks(np.arange(len(features)))
+    ax.set_xticklabels(features, rotation=30, ha="right", fontsize=8)
+    y_labels = [f"{reason} (n={int(counts[reason])})" for reason in reasons]
+    ax.set_yticks(np.arange(len(reasons)))
+    ax.set_yticklabels(y_labels, fontsize=9)
+
+    if matrix.size <= 160:
+        for i, reason in enumerate(reasons):
+            for j, feature in enumerate(features):
+                value = means.loc[reason, feature]
+                text = _format_entry_feature_value(feature, float(value))
+                ax.text(j, i, text, ha="center", va="center", fontsize=7)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Z-score within feature")
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def compute_entry_hour_exit_reason_distribution(
+    result: BacktestResult,
+) -> tuple[pd.DataFrame, dict]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    total_exit_trades = int(len(exit_trades))
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            continue
+        ts = pd.to_datetime(entry_time, errors="coerce")
+        if pd.isna(ts):
+            continue
+        if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+        hour = int(ts.hour)
+        reason = trade.get("exit_reason") or "unknown"
+        rows.append({"hour": hour, "exit_reason": str(reason)})
+
+    if not rows:
+        empty_df = pd.DataFrame(
+            columns=["hour", "label", "exit_reason", "count", "total_reason", "rate"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "reasons": 0,
+            "reason_totals": {},
+        }
+
+    df = pd.DataFrame(rows)
+    reason_totals = df.groupby("exit_reason").size().to_dict()
+    grouped = (
+        df.groupby(["exit_reason", "hour"], sort=True)
+        .size()
+        .reset_index(name="count")
+    )
+    grouped["total_reason"] = grouped["exit_reason"].map(reason_totals).astype(int)
+    grouped["rate"] = (
+        grouped["count"].astype(float) / grouped["total_reason"].astype(float) * 100.0
+    )
+    grouped["label"] = grouped["hour"].apply(lambda value: f"{int(value):02d}")
+    stats = {
+        "trades": total_exit_trades,
+        "trades_with_time": int(len(df)),
+        "reasons": int(len(reason_totals)),
+        "reason_totals": reason_totals,
+    }
+    return grouped, stats
+
+
+def create_entry_hour_exit_reason_chart(
+    result: BacktestResult,
+    output_path: Path,
+    title: Optional[str] = None,
+    max_reasons: int = 6,
+) -> Optional[Path]:
+    hour_df, stats = compute_entry_hour_exit_reason_distribution(result)
+    if hour_df.empty:
+        return None
+
+    reason_totals = stats.get("reason_totals") or {}
+    if not reason_totals:
+        return None
+
+    sorted_reasons = sorted(
+        reason_totals.items(), key=lambda item: item[1], reverse=True
+    )
+    top_reasons = [reason for reason, _ in sorted_reasons[:max_reasons]]
+    other_reasons = [reason for reason, _ in sorted_reasons[max_reasons:]]
+
+    filtered = hour_df[hour_df["exit_reason"].isin(top_reasons)].copy()
+    display_totals: dict[str, int] = {reason: int(reason_totals[reason]) for reason in top_reasons}
+    if other_reasons:
+        other_total = int(sum(reason_totals.get(reason, 0) for reason in other_reasons))
+        if other_total > 0:
+            other_counts = (
+                hour_df[hour_df["exit_reason"].isin(other_reasons)]
+                .groupby("hour", sort=True)["count"]
+                .sum()
+                .reset_index()
+            )
+            other_counts["exit_reason"] = "Other"
+            other_counts["total_reason"] = other_total
+            other_counts["rate"] = (
+                other_counts["count"].astype(float) / float(other_total) * 100.0
+            )
+            other_counts["label"] = other_counts["hour"].apply(
+                lambda value: f"{int(value):02d}"
+            )
+            filtered = pd.concat([filtered, other_counts], ignore_index=True)
+            display_totals["Other"] = other_total
+
+    reasons = list(display_totals.keys())
+    if not reasons:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hours = list(range(24))
+    fig, ax = plt.subplots(figsize=(10.5, 5.2))
+    color_cycle = plt.cm.tab10.colors
+
+    for idx, reason in enumerate(reasons):
+        sub = filtered[filtered["exit_reason"] == reason]
+        rate_map = {int(row["hour"]): float(row["rate"]) for _, row in sub.iterrows()}
+        rates = [rate_map.get(hour, 0.0) for hour in hours]
+        color = color_cycle[idx % len(color_cycle)]
+        total = display_totals.get(reason, 0)
+        ax.plot(
+            hours,
+            rates,
+            marker="o",
+            linewidth=1.6,
+            markersize=3.5,
+            label=f"{reason} (n={total})",
+            color=color,
+        )
+
+    ax.set_title(title or "Entry hour by exit reason")
+    ax.set_xlabel("Entry hour (0-23)")
+    ax.set_ylabel("Share within exit reason (%)")
+    ax.set_ylim(0, 100)
+    ax.set_xticks(list(range(0, 24, 2)))
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8, frameon=True)
+
+    trades = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_time", 0) or 0)
+    reasons_count = int(stats.get("reasons", 0) or 0)
+    stats_lines = [
+        f"Trades  {trades} (cov {covered})",
+        f"Reasons {reasons_count}",
+        f"Shown   {len(reasons)}",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
 def create_monthly_return_stability_chart(
     result: BacktestResult,
     output_path: Path,
@@ -777,6 +1491,240 @@ def create_monthly_return_stability_chart(
         if np.isfinite(stats.get("cv", np.nan)):
             stats_lines.append(f"CV      {stats.get('cv', 0.0):.2f}")
 
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def _resolve_trade_index(data: pd.DataFrame, target: Any) -> Optional[int]:
+    if data.empty:
+        return None
+    if "timestamp" in data.columns:
+        ts_col = data["timestamp"]
+        if pd.api.types.is_numeric_dtype(ts_col):
+            try:
+                target_val = float(target)
+            except (TypeError, ValueError):
+                return None
+            diffs = (ts_col.astype(float) - target_val).abs()
+            if diffs.isna().all():
+                return None
+            return int(diffs.idxmin())
+        target_ts = pd.to_datetime(target, errors="coerce")
+        if pd.isna(target_ts):
+            return None
+        ts_parsed = pd.to_datetime(ts_col, errors="coerce")
+        diffs = (ts_parsed - target_ts).abs()
+        if diffs.isna().all():
+            return None
+        return int(diffs.idxmin())
+    if isinstance(target, (int, np.integer)):
+        idx = int(target)
+        if 0 <= idx < len(data):
+            return idx
+    return None
+
+
+def _select_ema_column(data: pd.DataFrame, preferred: Optional[list[str]] = None) -> Optional[str]:
+    if data.empty:
+        return None
+    preferred = preferred or ["ema_fast", "ema_slow", "macro_ema", "ema"]
+    col_map = {str(col).lower(): str(col) for col in data.columns}
+    for name in preferred:
+        key = str(name).lower()
+        if key in col_map and pd.api.types.is_numeric_dtype(data[col_map[key]]):
+            return col_map[key]
+    ema_cols = [
+        str(col)
+        for col in data.columns
+        if "ema" in str(col).lower() and pd.api.types.is_numeric_dtype(data[col])
+    ]
+    if not ema_cols:
+        return None
+    ema_cols = sorted(ema_cols, key=lambda val: (len(val), val.lower()))
+    return ema_cols[0]
+
+
+def compute_entry_ema_change_frame(
+    result: BacktestResult,
+    data: pd.DataFrame,
+    lookback: int = 6,
+    ema_col: Optional[str] = None,
+) -> tuple[pd.DataFrame, dict]:
+    if data.empty:
+        return pd.DataFrame(), {"ema_col": None, "lookback": lookback, "trades": 0}
+    ema_col = ema_col or _select_ema_column(data)
+    if ema_col is None or ema_col not in data.columns:
+        return pd.DataFrame(), {"ema_col": None, "lookback": lookback, "trades": 0}
+    if lookback <= 0:
+        lookback = 1
+
+    ema_series = data[ema_col].astype(float)
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    rows: list[dict[str, Any]] = []
+    for trade in exit_trades:
+        entry_time = trade.get("entry_time")
+        idx = _resolve_trade_index(data, entry_time)
+        if idx is None or idx <= 0 or idx - lookback < 0:
+            continue
+        ema_now = float(ema_series.iloc[idx])
+        ema_prev = float(ema_series.iloc[idx - 1])
+        ema_lb = float(ema_series.iloc[idx - lookback])
+        if not np.isfinite(ema_now) or not np.isfinite(ema_prev) or not np.isfinite(ema_lb):
+            continue
+        if ema_prev == 0 or ema_lb == 0:
+            continue
+        log_change = np.log(ema_now / ema_prev) if ema_now > 0 and ema_prev > 0 else np.nan
+        pct_change = (ema_now - ema_prev) / ema_prev * 100.0
+        pct_change_n = (ema_now - ema_lb) / ema_lb * 100.0
+        try:
+            ret = float(trade.get("return"))
+        except (TypeError, ValueError):
+            try:
+                ret = float(trade.get("pnl"))
+            except (TypeError, ValueError):
+                continue
+        direction = trade.get("direction", 0)
+        try:
+            direction = int(direction)
+        except (TypeError, ValueError):
+            direction = 0
+        if direction not in {1, -1}:
+            side_hint = (
+                trade.get("side")
+                or trade.get("position_side")
+                or trade.get("positionSide")
+                or trade.get("entry_side")
+            )
+            if isinstance(side_hint, str):
+                side_norm = side_hint.strip().lower()
+                if side_norm in {"long", "buy", "l"}:
+                    direction = 1
+                elif side_norm in {"short", "sell", "s"}:
+                    direction = -1
+        rows.append(
+            {
+                "return": ret,
+                "return_pct": ret * 100.0,
+                "ema_log_change": log_change,
+                "ema_pct_change": pct_change,
+                "ema_pct_change_n": pct_change_n,
+                "direction": direction,
+            }
+        )
+
+    frame = pd.DataFrame(rows)
+    meta = {"ema_col": ema_col, "lookback": lookback, "trades": int(len(frame))}
+    return frame, meta
+
+
+def create_sorted_trade_metric_chart(
+    frame: pd.DataFrame,
+    metric_col: str,
+    output_path: Path,
+    title: str,
+    ylabel: str,
+    show_return: bool = True,
+    return_label: str = "Return (%)",
+    show_return_labels: bool = False,
+    return_label_limit: int = 40,
+    return_label_top_bottom: int = 10,
+) -> Optional[Path]:
+    if frame.empty or metric_col not in frame.columns:
+        return None
+    sort_col = "return" if "return" in frame.columns else None
+    if sort_col is None and "return_pct" in frame.columns:
+        sort_col = "return_pct"
+    if sort_col is None:
+        return None
+
+    return_series = None
+    if "return_pct" in frame.columns:
+        return_series = frame["return_pct"]
+    elif "return" in frame.columns:
+        return_series = frame["return"] * 100.0
+
+    cols = [sort_col, metric_col]
+    if return_series is not None:
+        frame = frame.copy()
+        frame["__return_display"] = return_series
+        cols.append("__return_display")
+
+    work = frame[cols].copy()
+    work = work.dropna(subset=[sort_col, metric_col])
+    if work.empty:
+        return None
+    work = work.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    values = work[metric_col].astype(float).to_numpy()
+    if values.size == 0:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = np.arange(1, len(values) + 1)
+    fig, ax = plt.subplots(figsize=(10.8, 4.8))
+    ax.plot(x, values, color="#1f77b4", linewidth=1.4)
+    ax.scatter(x, values, color="#1f77b4", s=8, alpha=0.65)
+    ax.axhline(0.0, color="#444444", linewidth=1.0, alpha=0.6)
+    ax.set_title(title)
+    ax.set_xlabel("Trades sorted by return (high → low)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xlim(1, max(1, len(values)))
+
+    if show_return and "__return_display" in work.columns:
+        ret_vals = work["__return_display"].astype(float).to_numpy()
+        ax2 = ax.twinx()
+        ax2.plot(x, ret_vals, color="#ff7f0e", linewidth=1.2, alpha=0.85)
+        ax2.scatter(x, ret_vals, color="#ff7f0e", s=7, alpha=0.5)
+        ax2.set_ylabel(return_label, color="#ff7f0e")
+        ax2.tick_params(axis="y", colors="#ff7f0e")
+        if show_return_labels:
+            total = len(ret_vals)
+            if total <= return_label_limit:
+                label_idx = list(range(total))
+            else:
+                head = list(range(min(return_label_top_bottom, total)))
+                tail = list(range(max(total - return_label_top_bottom, 0), total))
+                label_idx = sorted(set(head + tail))
+            for idx in label_idx:
+                val = ret_vals[idx]
+                ax2.text(
+                    x[idx],
+                    val,
+                    f"{val:+.2f}%",
+                    fontsize=7,
+                    color="#ff7f0e",
+                    rotation=45,
+                    ha="left",
+                    va="bottom" if val >= 0 else "top",
+                    alpha=0.75,
+                )
+
+    stats_lines = [
+        f"Trades {len(values)}",
+        f"Mean {float(np.mean(values)):.4g}",
+        f"Median {float(np.median(values)):.4g}",
+    ]
+    if show_return and "__return_display" in work.columns:
+        ret_vals = work["__return_display"].astype(float).to_numpy()
+        if ret_vals.size:
+            stats_lines.append(f"Return mean {float(np.mean(ret_vals)):.3g}%")
     ax.text(
         0.01,
         0.98,
@@ -919,6 +1867,266 @@ def create_entry_minute_tp_rate_chart(
         ha="left",
         va="top",
         fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_tp_target_win_rate_chart(
+    result: BacktestResult,
+    output_path: Path,
+    bin_size: float = 5.0,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    bucket_df, stats = compute_tp_target_win_rate(result, bin_size=bin_size)
+    if bucket_df.empty:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = bucket_df["label"].astype(str).to_list()
+    win_rates = bucket_df["win_rate"].astype(float).to_list()
+    totals = bucket_df["total"].astype(int).to_list()
+
+    x = np.arange(len(labels))
+    colors = ["#2ca02c" if rate >= 50.0 else "#d62728" for rate in win_rates]
+
+    fig_width = 9.5 if len(labels) <= 12 else min(16.0, 7.5 + len(labels) * 0.4)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+    bars = ax.bar(x, win_rates, color=colors, alpha=0.85)
+    ax.set_ylim(0, 100)
+    ax.set_title(title or f"Win rate by target TP (bin={bin_size:g})")
+    ax.set_ylabel("Win rate (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 12 else 0, ha="right")
+
+    for idx, bar in enumerate(bars):
+        height = bar.get_height()
+        total = totals[idx]
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            min(100, height + 2.0),
+            f"{height:.1f}%\nT {total}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#2c2c2c",
+        )
+
+    trades = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_target", 0) or 0)
+    stats_lines = [
+        f"Trades  {trades} (cov {covered})",
+        f"Buckets {stats.get('buckets', 0)}",
+        f"Bin     {stats.get('bin_size', bin_size):g}",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_sl_target_win_rate_chart(
+    result: BacktestResult,
+    output_path: Path,
+    bin_size: float = 5.0,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    bucket_df, stats = compute_sl_target_win_rate(result, bin_size=bin_size)
+    if bucket_df.empty:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = bucket_df["label"].astype(str).to_list()
+    win_rates = bucket_df["win_rate"].astype(float).to_list()
+    totals = bucket_df["total"].astype(int).to_list()
+
+    x = np.arange(len(labels))
+    colors = ["#2ca02c" if rate >= 50.0 else "#d62728" for rate in win_rates]
+
+    fig_width = 9.5 if len(labels) <= 12 else min(16.0, 7.5 + len(labels) * 0.4)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+    bars = ax.bar(x, win_rates, color=colors, alpha=0.85)
+    ax.set_ylim(0, 100)
+    ax.set_title(title or f"Win rate by target SL (bin={bin_size:g})")
+    ax.set_ylabel("Win rate (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 12 else 0, ha="right")
+
+    for idx, bar in enumerate(bars):
+        height = bar.get_height()
+        total = totals[idx]
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            min(100, height + 2.0),
+            f"{height:.1f}%\nT {total}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#2c2c2c",
+        )
+
+    trades = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_target", 0) or 0)
+    stats_lines = [
+        f"Trades  {trades} (cov {covered})",
+        f"Buckets {stats.get('buckets', 0)}",
+        f"Bin     {stats.get('bin_size', bin_size):g}",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_tp_sl_target_win_rate_chart(
+    result: BacktestResult,
+    output_path: Path,
+    bin_size: float = 5.0,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    tp_df, tp_stats = compute_tp_target_win_rate(result, bin_size=bin_size)
+    sl_df, sl_stats = compute_sl_target_win_rate(result, bin_size=bin_size)
+    if tp_df.empty and sl_df.empty:
+        return None
+
+    tp_df = tp_df.copy()
+    sl_df = sl_df.copy()
+    if not tp_df.empty:
+        tp_df["bucket_start"] = tp_df["bucket_start"].astype(float)
+    if not sl_df.empty:
+        sl_df["bucket_start"] = sl_df["bucket_start"].astype(float)
+
+    bucket_starts = sorted(
+        set(tp_df["bucket_start"].tolist() if not tp_df.empty else [])
+        | set(sl_df["bucket_start"].tolist() if not sl_df.empty else [])
+    )
+    tp_starts = set(tp_df["bucket_start"].tolist()) if not tp_df.empty else set()
+    sl_starts = set(sl_df["bucket_start"].tolist()) if not sl_df.empty else set()
+    labels = []
+    for start in bucket_starts:
+        if start in tp_starts:
+            label = tp_df.loc[tp_df["bucket_start"] == start, "label"].iloc[0]
+        elif start in sl_starts:
+            label = sl_df.loc[sl_df["bucket_start"] == start, "label"].iloc[0]
+        else:
+            label = f"{start:g}-{start + float(bin_size):g}"
+        labels.append(str(label))
+
+    tp_map = (
+        dict(zip(tp_df["bucket_start"], tp_df["win_rate"]))
+        if not tp_df.empty
+        else {}
+    )
+    sl_map = (
+        dict(zip(sl_df["bucket_start"], sl_df["win_rate"]))
+        if not sl_df.empty
+        else {}
+    )
+    tp_rates = [float(tp_map.get(start, np.nan)) for start in bucket_starts]
+    sl_rates = [float(sl_map.get(start, np.nan)) for start in bucket_starts]
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = np.arange(len(labels))
+    width = 0.38
+    fig_width = 10.5 if len(labels) <= 12 else min(16.5, 8.0 + len(labels) * 0.45)
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8))
+
+    tp_positions = x - width / 2
+    sl_positions = x + width / 2
+    tp_bars = ax.bar(
+        tp_positions,
+        [0 if not np.isfinite(val) else val for val in tp_rates],
+        width=width,
+        color="#1f77b4",
+        alpha=0.85,
+        label="TP target",
+    )
+    sl_bars = ax.bar(
+        sl_positions,
+        [0 if not np.isfinite(val) else val for val in sl_rates],
+        width=width,
+        color="#ff7f0e",
+        alpha=0.85,
+        label="SL target",
+    )
+
+    ax.set_ylim(0, 100)
+    ax.set_title(title or f"Win rate by target TP/SL (bin={bin_size:g})")
+    ax.set_ylabel("Win rate (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 12 else 0, ha="right")
+    ax.legend(loc="best", fontsize=9)
+
+    for bars, rates in ((tp_bars, tp_rates), (sl_bars, sl_rates)):
+        for bar, rate in zip(bars, rates, strict=False):
+            if not np.isfinite(rate):
+                continue
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                min(100, rate + 2.0),
+                f"{rate:.1f}%",
+                ha="center",
+                va="bottom",
+                fontsize=7.5,
+                color="#2c2c2c",
+            )
+
+    tp_trades = int(tp_stats.get("trades_with_target", 0) or 0)
+    sl_trades = int(sl_stats.get("trades_with_target", 0) or 0)
+    stats_lines = [
+        f"TP cov {tp_trades} | SL cov {sl_trades}",
+        f"TP buckets {tp_stats.get('buckets', 0)}",
+        f"SL buckets {sl_stats.get('buckets', 0)}",
+    ]
+    ax.text(
+        0.01,
+        0.98,
+        "\n".join(stats_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.2,
         family="monospace",
         bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
     )
@@ -1926,6 +3134,158 @@ def create_trade_snapshot_chart(
             linewidth=1.1,
             label="Macro EMA",
         )
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="best")
+
+    if timestamps is not None:
+        tick_count = min(6, len(view))
+        tick_idx = np.linspace(0, len(view) - 1, num=tick_count, dtype=int)
+        ax.set_xticks(x_values[tick_idx])
+        labels = []
+        for idx in tick_idx:
+            ts = timestamps.iloc[idx]
+            if pd.isna(ts):
+                labels.append("")
+            else:
+                labels.append(ts.strftime("%Y-%m-%d %H:%M"))
+        ax.set_xticklabels(labels, fontsize=8)
+    else:
+        ax.set_xticks([])
+
+    if title:
+        ax.set_title(title, fontsize=10)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_trade_lookback_extreme_chart(
+    data: pd.DataFrame,
+    entry_time: Any,
+    extreme_time: Any,
+    extreme_price: Optional[float],
+    output_path: Path,
+    title: Optional[str] = None,
+    max_candles: int = 240,
+) -> Optional[Path]:
+    if data.empty:
+        return None
+    entry_idx = _resolve_trade_index(data, entry_time)
+    extreme_idx = _resolve_trade_index(data, extreme_time)
+    if entry_idx is None or extreme_idx is None:
+        return None
+    if extreme_idx >= entry_idx or extreme_idx < 0:
+        return None
+
+    view = data.iloc[extreme_idx : entry_idx + 1].copy()
+    required_cols = {"open", "high", "low", "close"}
+    if not required_cols.issubset(view.columns):
+        return None
+    if view.empty:
+        return None
+
+    if len(view) > max_candles:
+        view = _downsample_ohlc(view, max_candles=max_candles)
+        entry_rel = _resolve_trade_index(view, entry_time)
+        extreme_rel = _resolve_trade_index(view, extreme_time)
+        if entry_rel is None or extreme_rel is None:
+            return None
+    else:
+        entry_rel = entry_idx - extreme_idx
+        extreme_rel = 0
+
+    x_values = np.arange(len(view))
+    timestamps = None
+    if "timestamp" in view.columns:
+        ts = pd.to_datetime(view["timestamp"], errors="coerce")
+        if not ts.isna().all():
+            timestamps = ts
+
+    entry_row = data.iloc[entry_idx]
+    entry_price = float(entry_row.get("open", entry_row.get("close", np.nan)))
+    if extreme_price is None:
+        extreme_row = data.iloc[extreme_idx]
+        extreme_price = float(extreme_row.get("low", extreme_row.get("high", np.nan)))
+    if extreme_price is None or not np.isfinite(extreme_price):
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    from matplotlib.patches import Rectangle
+
+    up_color = "#2ca02c"
+    down_color = "#d62728"
+    neutral_color = "#7f7f7f"
+    extreme_color = "#1f77b4"
+    candle_width = 0.6
+    wick_width = 1.0
+
+    ohlc = view[["open", "high", "low", "close"]].astype(float)
+    for i, (open_p, high_p, low_p, close_p) in enumerate(ohlc.itertuples(index=False)):
+        if np.isnan(open_p) or np.isnan(high_p) or np.isnan(low_p) or np.isnan(close_p):
+            continue
+        if close_p > open_p:
+            color = up_color
+        elif close_p < open_p:
+            color = down_color
+        else:
+            color = neutral_color
+
+        ax.vlines(
+            x_values[i],
+            low_p,
+            high_p,
+            color=color,
+            linewidth=wick_width,
+            zorder=2,
+        )
+        body_low = min(open_p, close_p)
+        body_height = abs(close_p - open_p)
+        if body_height == 0:
+            ax.hlines(
+                open_p,
+                x_values[i] - candle_width / 2,
+                x_values[i] + candle_width / 2,
+                color=color,
+                linewidth=2.0,
+                zorder=3,
+            )
+        else:
+            rect = Rectangle(
+                (x_values[i] - candle_width / 2, body_low),
+                candle_width,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.5,
+                zorder=3,
+            )
+            ax.add_patch(rect)
+
+    ax.scatter(
+        [x_values[extreme_rel]],
+        [extreme_price],
+        color=extreme_color,
+        s=52,
+        zorder=5,
+        label="Lookback extreme",
+    )
+    ax.scatter(
+        [x_values[entry_rel]],
+        [entry_price],
+        color=up_color,
+        s=52,
+        zorder=5,
+        label="Entry",
+    )
+    ax.axvline(x_values[extreme_rel], color=extreme_color, linewidth=0.8, alpha=0.4)
+    ax.axvline(x_values[entry_rel], color=up_color, linewidth=0.8, alpha=0.4)
     ax.set_ylabel("Price")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="best")

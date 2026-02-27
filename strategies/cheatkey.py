@@ -110,6 +110,9 @@ class CheatkeyStrategy(Strategy):
         slope_exit_ignore_threshold_after_add: bool = False,
         long_leverage: float = 10.0,
         short_leverage: float = 10.0,
+        auto_leverage_min_loss_pnl: float | None = None,
+        auto_leverage_max_loss_pnl: float | None = None,
+        auto_leverage_max_leverage: float | None = None,
         long_tp_pnl: float = 15.0,
         short_tp_pnl: float = 15.0,
         long_add_tp_pnl: list[float] | None = None,
@@ -157,6 +160,7 @@ class CheatkeyStrategy(Strategy):
         prev_extreme_rr_buffer_pct: float = 0.1,
         prev_extreme_rr_multiplier: float = 2.0,
         prev_extreme_rr_max_loss_pct: float | None = None,
+        prev_extreme_rr_min_loss_pct: float | None = None,
         use_prev_extreme_rr_tp_cap: bool = False,
         prev_extreme_rr_tp_cap_lookback: int = 20,
         prev_extreme_rr_tp_cap_buffer_pct: float = 0.1,
@@ -219,6 +223,12 @@ class CheatkeyStrategy(Strategy):
         self.slope_exit_ignore_threshold_after_add = slope_exit_ignore_threshold_after_add
         self.long_leverage = long_leverage
         self.short_leverage = short_leverage
+        self.auto_leverage_min_loss_pnl = _normalize_pct(auto_leverage_min_loss_pnl)
+        self.auto_leverage_max_loss_pnl = _normalize_pct(auto_leverage_max_loss_pnl)
+        try:
+            self.auto_leverage_max_leverage = float(auto_leverage_max_leverage)
+        except (TypeError, ValueError):
+            self.auto_leverage_max_leverage = None
         self.long_tp_pnl = _normalize_pct(long_tp_pnl)
         self.short_tp_pnl = _normalize_pct(short_tp_pnl)
         self.long_add_tp_pnl = _normalize_pct_list(long_add_tp_pnl)
@@ -272,6 +282,7 @@ class CheatkeyStrategy(Strategy):
         except (TypeError, ValueError):
             self.prev_extreme_rr_multiplier = 0.0
         self.prev_extreme_rr_max_loss_pct = _normalize_pct(prev_extreme_rr_max_loss_pct)
+        self.prev_extreme_rr_min_loss_pct = _normalize_pct(prev_extreme_rr_min_loss_pct)
         self.use_prev_extreme_rr_tp_cap = use_prev_extreme_rr_tp_cap
         self.prev_extreme_rr_tp_cap_lookback = int(prev_extreme_rr_tp_cap_lookback)
         self.prev_extreme_rr_tp_cap_buffer_pct = (
