@@ -37,6 +37,8 @@ class Position:
     parts_filled: int = 0
     last_signal_index: int = 0
     slope_exit_cooldown: int = 0
+    auto_leverage_min_loss_applied: bool = False
+    auto_leverage_min_loss_multiplier: float | None = None
 
 
 def _atr(df: pd.DataFrame, window: int) -> pd.Series:
@@ -84,6 +86,7 @@ class BacktestEngine:
         close_open_positions: bool = True,
         ignore_last_row_signals: bool = False,
         suppress_signals_from_index: Optional[int] = None,
+        suppress_signals_before_index: Optional[int] = None,
     ) -> BacktestResult:
         if self.data.empty:
             raise ValueError("No data to backtest")
@@ -125,6 +128,17 @@ class BacktestEngine:
                 signals.iloc[idx:] = 0
                 exit_signals.iloc[idx:] = 0
                 reasons.iloc[idx:] = ""
+        if suppress_signals_before_index is not None and len(self.data) > 0:
+            idx = int(suppress_signals_before_index)
+            if idx >= len(self.data):
+                idx = len(self.data) - 1
+            if idx >= 0:
+                signals = signals.copy()
+                reasons = reasons.copy()
+                exit_signals = exit_signals.copy()
+                signals.iloc[: idx + 1] = 0
+                exit_signals.iloc[: idx + 1] = 0
+                reasons.iloc[: idx + 1] = ""
 
         cash = float(self.initial_balance)
         long_position: Optional[Position] = None
@@ -137,6 +151,8 @@ class BacktestEngine:
         atr_window = getattr(self.strategy, "atr_window", None)
         time_stop_bars = getattr(self.strategy, "time_stop_bars", None)
         time_stop_min_r = getattr(self.strategy, "time_stop_min_r", None)
+        use_timeout_exit = getattr(self.strategy, "use_timeout_exit", False)
+        timeout_exit_minutes = getattr(self.strategy, "timeout_exit_minutes", None)
         long_leverage = getattr(self.strategy, "long_leverage", None)
         short_leverage = getattr(self.strategy, "short_leverage", None)
         long_tp_pnl = getattr(self.strategy, "long_tp_pnl", None)
@@ -170,6 +186,13 @@ class BacktestEngine:
         move_sl_use_ratio = getattr(self.strategy, "move_sl_use_ratio", False)
         move_sl_trigger_ratio = getattr(self.strategy, "move_sl_trigger_ratio", None)
         move_sl_target_ratio = getattr(self.strategy, "move_sl_target_ratio", None)
+        move_sl_peak_drawdown_use = getattr(self.strategy, "move_sl_peak_drawdown_use", False)
+        move_sl_peak_drawdown_trigger_pnl = getattr(
+            self.strategy, "move_sl_peak_drawdown_trigger_pnl", None
+        )
+        move_sl_peak_drawdown_exit_pnl = getattr(
+            self.strategy, "move_sl_peak_drawdown_exit_pnl", None
+        )
         move_tp_on_loss = getattr(self.strategy, "move_tp_on_loss", False)
         move_tp_trigger_pnl = getattr(self.strategy, "move_tp_trigger_pnl", None)
         move_tp_target_pnl = getattr(self.strategy, "move_tp_target_pnl", None)
@@ -178,6 +201,23 @@ class BacktestEngine:
         auto_leverage_min_loss_pnl = getattr(self.strategy, "auto_leverage_min_loss_pnl", None)
         auto_leverage_max_loss_pnl = getattr(self.strategy, "auto_leverage_max_loss_pnl", None)
         auto_leverage_max_leverage = getattr(self.strategy, "auto_leverage_max_leverage", None)
+        use_auto_leverage_min_loss_multiplier = getattr(
+            self.strategy, "use_auto_leverage_min_loss_multiplier", False
+        )
+        auto_leverage_min_loss_multiplier = getattr(
+            self.strategy, "auto_leverage_min_loss_multiplier", None
+        )
+        use_auto_leverage_sl_multiplier = getattr(
+            self.strategy, "use_auto_leverage_sl_multiplier", True
+        )
+        auto_leverage_sl_min_pct = getattr(self.strategy, "auto_leverage_sl_min_pct", None)
+        auto_leverage_sl_max_pct = getattr(self.strategy, "auto_leverage_sl_max_pct", None)
+        auto_leverage_sl_min_multiplier = getattr(
+            self.strategy, "auto_leverage_sl_min_multiplier", None
+        )
+        auto_leverage_sl_max_multiplier = getattr(
+            self.strategy, "auto_leverage_sl_max_multiplier", None
+        )
         long_partial_exit_pnl = getattr(self.strategy, "long_partial_exit_pnl", None)
         short_partial_exit_pnl = getattr(self.strategy, "short_partial_exit_pnl", None)
         partial_exit_mode = getattr(self.strategy, "partial_exit_mode", None)
@@ -293,6 +333,33 @@ class BacktestEngine:
             macro_long_prev = current_close > macro_ema
             macro_short_prev = current_close < macro_ema
 
+        peak_drawdown_trigger_pnl = None
+        peak_drawdown_exit_pnl = None
+        use_peak_drawdown_exit = False
+        try:
+            peak_drawdown_trigger_pnl = (
+                float(move_sl_peak_drawdown_trigger_pnl)
+                if move_sl_peak_drawdown_trigger_pnl is not None
+                else None
+            )
+            peak_drawdown_exit_pnl = (
+                float(move_sl_peak_drawdown_exit_pnl)
+                if move_sl_peak_drawdown_exit_pnl is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            peak_drawdown_trigger_pnl = None
+            peak_drawdown_exit_pnl = None
+        if (
+            move_sl_peak_drawdown_use
+            and peak_drawdown_trigger_pnl is not None
+            and peak_drawdown_exit_pnl is not None
+            and peak_drawdown_trigger_pnl > 0
+            and peak_drawdown_exit_pnl > 0
+        ):
+            use_peak_drawdown_exit = True
+            move_sl_on_profit = False
+
         def _update_position_extremes(
             position: Position,
             close_price: float,
@@ -343,6 +410,27 @@ class BacktestEngine:
                 return entry_price * (1.0 + pnl_unlevered)
             return entry_price * (1.0 - pnl_unlevered)
 
+        def _resolve_peak_drawdown_exit_price(
+            position: Position,
+            leverage_value: float,
+        ) -> float | None:
+            if not use_peak_drawdown_exit:
+                return None
+            if peak_drawdown_trigger_pnl is None or peak_drawdown_exit_pnl is None:
+                return None
+            if position.max_return < peak_drawdown_trigger_pnl:
+                return None
+            entry_price = position.entry_price
+            if entry_price <= 0:
+                return None
+            if leverage_value <= 0:
+                leverage_value = 1.0
+            trailing_return = position.max_return - peak_drawdown_exit_pnl
+            unlevered = trailing_return / leverage_value
+            if position.direction > 0:
+                return entry_price * (1.0 + unlevered)
+            return entry_price * (1.0 - unlevered)
+
         def _resolve_effective_tp_sl(position: Position, index: int) -> tuple[float | None, float | None]:
             tp_pnl = long_tp_pnl if position.direction > 0 else short_tp_pnl
             sl_pnl = long_sl_pnl if position.direction > 0 else short_sl_pnl
@@ -379,6 +467,13 @@ class BacktestEngine:
                         tp_pnl = abs(sl_val) * rr_mult
             return tp_pnl, sl_pnl
 
+        def _elapsed_minutes(entry_time: Any, now_time: Any) -> float | None:
+            if isinstance(entry_time, pd.Timestamp) and isinstance(now_time, pd.Timestamp):
+                return (now_time - entry_time).total_seconds() / 60.0
+            if isinstance(entry_time, (int, float)) and isinstance(now_time, (int, float)):
+                return float(now_time) - float(entry_time)
+            return None
+
         def _enter_position(
             signal: int,
             next_open: float,
@@ -399,6 +494,41 @@ class BacktestEngine:
             stop_distance = None
             risk_pct = 0.0
             rr_min_loss_target = None
+            rr_sl_multiplier = None
+            rr_mult_base = None
+
+            def _calc_sl_multiplier(sl_pct: float | None) -> float | None:
+                if not use_auto_leverage_sl_multiplier:
+                    return None
+                if sl_pct is None or sl_pct <= 0:
+                    return None
+                if (
+                    auto_leverage_sl_min_pct is None
+                    or auto_leverage_sl_max_pct is None
+                    or auto_leverage_sl_min_multiplier is None
+                    or auto_leverage_sl_max_multiplier is None
+                ):
+                    return None
+                try:
+                    sl_min_pct = float(auto_leverage_sl_min_pct)
+                    sl_max_pct = float(auto_leverage_sl_max_pct)
+                    sl_min_mult = float(auto_leverage_sl_min_multiplier)
+                    sl_max_mult = float(auto_leverage_sl_max_multiplier)
+                except (TypeError, ValueError):
+                    return None
+                if sl_min_pct > sl_max_pct:
+                    sl_min_pct, sl_max_pct = sl_max_pct, sl_min_pct
+                    sl_min_mult, sl_max_mult = sl_max_mult, sl_min_mult
+                if sl_min_pct > 1 or sl_max_pct > 1:
+                    sl_min_pct /= 100.0
+                    sl_max_pct /= 100.0
+                if sl_min_pct <= sl_pct <= sl_max_pct:
+                    span = sl_max_pct - sl_min_pct
+                    if span > 0:
+                        ratio = (sl_pct - sl_min_pct) / span
+                        return sl_min_mult + ratio * (sl_max_mult - sl_min_mult)
+                    return sl_min_mult
+                return None
 
             def _cap_prev_extreme_stop(
                 stop_price_val: float | None,
@@ -499,42 +629,7 @@ class BacktestEngine:
                                     rr_mult = float(prev_extreme_rr_multiplier)
                                 except (TypeError, ValueError):
                                     rr_mult = None
-                            if rr_mult is not None and rr_mult > 0:
-                                risk_distance = abs(float(next_open) - float(rr_stop_price))
-                                if risk_distance > 0:
-                                    if signal > 0:
-                                        rr_tp_price = float(next_open) + risk_distance * rr_mult
-                                    else:
-                                        rr_tp_price = float(next_open) - risk_distance * rr_mult
-                            if (
-                                rr_tp_price is not None
-                                and use_prev_extreme_rr_tp_cap
-                                and prev_extreme_rr_tp_cap_lookback
-                            ):
-                                try:
-                                    tp_lookback_n = max(int(prev_extreme_rr_tp_cap_lookback), 1)
-                                except (TypeError, ValueError):
-                                    tp_lookback_n = 0
-                                if tp_lookback_n > 0 and entry_index - tp_lookback_n >= 0:
-                                    if "low" in self.data.columns and "high" in self.data.columns:
-                                        tp_window = self.data.iloc[
-                                            entry_index - tp_lookback_n : entry_index
-                                        ]
-                                        tp_buffer = float(prev_extreme_rr_tp_cap_buffer_pct or 0.0)
-                                        if signal > 0:
-                                            prior_high = tp_window["high"].max()
-                                            if pd.notna(prior_high) and float(prior_high) > 0:
-                                                if rr_tp_price > float(prior_high):
-                                                    cap_price = float(prior_high) * (1.0 - tp_buffer)
-                                                    if cap_price > float(next_open):
-                                                        rr_tp_price = cap_price
-                                        else:
-                                            prior_low = tp_window["low"].min()
-                                            if pd.notna(prior_low) and float(prior_low) > 0:
-                                                if rr_tp_price < float(prior_low):
-                                                    cap_price = float(prior_low) * (1.0 + tp_buffer)
-                                                    if cap_price < float(next_open):
-                                                        rr_tp_price = cap_price
+                            rr_mult_base = rr_mult
 
             if (not use_prev_extreme_rr) and use_prev_extreme_stop and prev_extreme_lookback:
                 try:
@@ -578,6 +673,7 @@ class BacktestEngine:
                 leverage_min_target = rr_min_loss_target
             else:
                 leverage_min_target = auto_min_loss
+            min_loss_breach = False
             if (leverage_min_target is not None and leverage_min_target > 0) or (
                 auto_max_loss is not None and auto_max_loss > 0
             ):
@@ -588,31 +684,100 @@ class BacktestEngine:
                     stop_for_leverage = rr_stop_price
                 elif prev_extreme_stop_price is not None:
                     stop_for_leverage = prev_extreme_stop_price
+                risk_pct_for_leverage = None
                 if stop_for_leverage is not None and float(next_open) > 0:
                     risk_distance = abs(float(next_open) - float(stop_for_leverage))
                     if risk_distance > 0:
                         risk_pct_for_leverage = risk_distance / float(next_open)
-                        target_leverage = leverage_value
-                        if leverage_min_target is not None and leverage_min_target > 0:
-                            target_leverage = max(
-                                target_leverage,
-                                leverage_min_target / risk_pct_for_leverage,
-                            )
-                        if auto_max_loss is not None and auto_max_loss > 0:
-                            target_leverage = min(
-                                target_leverage,
-                                auto_max_loss / risk_pct_for_leverage,
-                            )
-                        max_leverage = None
-                        if auto_leverage_max_leverage is not None:
-                            try:
-                                max_leverage = float(auto_leverage_max_leverage)
-                            except (TypeError, ValueError):
-                                max_leverage = None
-                        if max_leverage is not None and max_leverage > 0:
-                            target_leverage = min(target_leverage, max_leverage)
-                        if target_leverage > 0:
-                            leverage_value = target_leverage
+                if risk_pct_for_leverage is not None and risk_pct_for_leverage > 0:
+                    if auto_min_loss is not None and auto_min_loss > 0:
+                        leveraged_loss = risk_pct_for_leverage * leverage_value
+                        if leveraged_loss < auto_min_loss:
+                            min_loss_breach = True
+                    target_leverage = leverage_value
+                    if leverage_min_target is not None and leverage_min_target > 0:
+                        target_leverage = max(
+                            target_leverage,
+                            leverage_min_target / risk_pct_for_leverage,
+                        )
+                    if auto_max_loss is not None and auto_max_loss > 0:
+                        target_leverage = min(
+                            target_leverage,
+                            auto_max_loss / risk_pct_for_leverage,
+                        )
+                    max_leverage = None
+                    if auto_leverage_max_leverage is not None:
+                        try:
+                            max_leverage = float(auto_leverage_max_leverage)
+                        except (TypeError, ValueError):
+                            max_leverage = None
+                    if max_leverage is not None and max_leverage > 0:
+                        target_leverage = min(target_leverage, max_leverage)
+                    if target_leverage > 0:
+                        leverage_value = target_leverage
+
+            min_loss_rr_mult = None
+            if (
+                use_auto_leverage_min_loss_multiplier
+                and min_loss_breach
+                and auto_leverage_min_loss_multiplier is not None
+            ):
+                try:
+                    min_loss_rr_mult = float(auto_leverage_min_loss_multiplier)
+                except (TypeError, ValueError):
+                    min_loss_rr_mult = None
+            rr_mult_value = rr_mult_base
+            auto_min_loss_multiplier_used = None
+            if min_loss_rr_mult is not None and min_loss_rr_mult > 0:
+                rr_mult_value = min_loss_rr_mult
+                auto_min_loss_multiplier_used = min_loss_rr_mult
+            if (
+                use_prev_extreme_rr
+                and rr_stop_price is not None
+                and rr_mult_value is not None
+                and rr_mult_value > 0
+                and float(next_open) > 0
+            ):
+                rr_mult_base = rr_mult_value
+                risk_distance = abs(float(next_open) - float(rr_stop_price))
+                if risk_distance > 0:
+                    sl_pct = (risk_distance / float(next_open)) * leverage_value
+                    rr_sl_multiplier = _calc_sl_multiplier(sl_pct)
+                    rr_mult = rr_mult_base
+                    if rr_sl_multiplier is not None and rr_sl_multiplier > 0:
+                        rr_mult *= rr_sl_multiplier
+                    if rr_mult > 0:
+                        if signal > 0:
+                            rr_tp_price = float(next_open) + risk_distance * rr_mult
+                        else:
+                            rr_tp_price = float(next_open) - risk_distance * rr_mult
+                if (
+                    rr_tp_price is not None
+                    and use_prev_extreme_rr_tp_cap
+                    and prev_extreme_rr_tp_cap_lookback
+                ):
+                    try:
+                        tp_lookback_n = max(int(prev_extreme_rr_tp_cap_lookback), 1)
+                    except (TypeError, ValueError):
+                        tp_lookback_n = 0
+                    if tp_lookback_n > 0 and entry_index - tp_lookback_n >= 0:
+                        if "low" in self.data.columns and "high" in self.data.columns:
+                            tp_window = self.data.iloc[entry_index - tp_lookback_n : entry_index]
+                            tp_buffer = float(prev_extreme_rr_tp_cap_buffer_pct or 0.0)
+                            if signal > 0:
+                                prior_high = tp_window["high"].max()
+                                if pd.notna(prior_high) and float(prior_high) > 0:
+                                    if rr_tp_price > float(prior_high):
+                                        cap_price = float(prior_high) * (1.0 - tp_buffer)
+                                        if cap_price > float(next_open):
+                                            rr_tp_price = cap_price
+                            else:
+                                prior_low = tp_window["low"].min()
+                                if pd.notna(prior_low) and float(prior_low) > 0:
+                                    if rr_tp_price < float(prior_low):
+                                        cap_price = float(prior_low) * (1.0 + tp_buffer)
+                                        if cap_price < float(next_open):
+                                            rr_tp_price = cap_price
 
             qty = self._calc_qty(cash, next_open, stop_distance, leverage_value)
             parts = _resolve_parts()
@@ -648,6 +813,8 @@ class BacktestEngine:
                 slope_exit_cooldown=int(slope_exit_cooldown_bars)
                 if slope_exit_cooldown_bars is not None
                 else 0,
+                auto_leverage_min_loss_applied=bool(min_loss_breach),
+                auto_leverage_min_loss_multiplier=auto_min_loss_multiplier_used,
             )
             position.qty = position.base_qty + position.added_qty
             if position.qty > 0:
@@ -665,6 +832,8 @@ class BacktestEngine:
                     "stop_price": stop_price,
                     "rr_stop_price": rr_stop_price,
                     "rr_tp_price": rr_tp_price,
+                    "auto_leverage_min_loss_applied": bool(min_loss_breach),
+                    "auto_leverage_min_loss_multiplier": auto_min_loss_multiplier_used,
                 }
             )
             return position
@@ -763,6 +932,28 @@ class BacktestEngine:
                             position.rr_stop_price = rr_stop_price
                         if prev_rr_stop_price != rr_stop_price and rr_stop_price is not None:
                             position.moved_sl_on_profit = True
+                peak_drawdown_price = _resolve_peak_drawdown_exit_price(position, leverage_value)
+                if peak_drawdown_price is not None:
+                    if position.direction > 0 and low_price <= peak_drawdown_price:
+                        cash = self._close_position(
+                            cash=cash,
+                            position=position,
+                            trades=trades,
+                            exit_price=peak_drawdown_price,
+                            timestamp=timestamp,
+                            exit_reason="peak_drawdown_exit",
+                        )
+                        return None
+                    if position.direction < 0 and high_price >= peak_drawdown_price:
+                        cash = self._close_position(
+                            cash=cash,
+                            position=position,
+                            trades=trades,
+                            exit_price=peak_drawdown_price,
+                            timestamp=timestamp,
+                            exit_reason="peak_drawdown_exit",
+                        )
+                        return None
                 if rr_stop_price is not None:
                     if position.direction > 0 and low_price <= rr_stop_price:
                         cash = self._close_position(
@@ -943,6 +1134,29 @@ class BacktestEngine:
                         if prev_tp_pnl is None or float(tp_pnl) > float(prev_tp_pnl):
                             position.moved_tp_on_loss = True
 
+                peak_drawdown_price = _resolve_peak_drawdown_exit_price(position, leverage_value)
+                if peak_drawdown_price is not None:
+                    if position.direction > 0 and low_price <= peak_drawdown_price:
+                        cash = self._close_position(
+                            cash=cash,
+                            position=position,
+                            trades=trades,
+                            exit_price=peak_drawdown_price,
+                            timestamp=timestamp,
+                            exit_reason="peak_drawdown_exit",
+                        )
+                        return None
+                    if position.direction < 0 and high_price >= peak_drawdown_price:
+                        cash = self._close_position(
+                            cash=cash,
+                            position=position,
+                            trades=trades,
+                            exit_price=peak_drawdown_price,
+                            timestamp=timestamp,
+                            exit_reason="peak_drawdown_exit",
+                        )
+                        return None
+
                 if entry_price > 0 and sl_pnl is not None:
                     sl_unlevered = float(sl_pnl) / leverage_value
                     if position.direction > 0:
@@ -1023,6 +1237,24 @@ class BacktestEngine:
                             exit_price=close_price,
                             timestamp=timestamp,
                             exit_reason="time_stop",
+                        )
+                        return None
+
+            if use_timeout_exit and timeout_exit_minutes is not None:
+                try:
+                    timeout_minutes = float(timeout_exit_minutes)
+                except (TypeError, ValueError):
+                    timeout_minutes = None
+                if timeout_minutes is not None and timeout_minutes > 0:
+                    elapsed = _elapsed_minutes(position.entry_time, timestamp)
+                    if elapsed is not None and elapsed >= timeout_minutes:
+                        cash = self._close_position(
+                            cash=cash,
+                            position=position,
+                            trades=trades,
+                            exit_price=close_price,
+                            timestamp=timestamp,
+                            exit_reason="timeout_minutes_exit",
                         )
                         return None
 
@@ -1447,6 +1679,10 @@ class BacktestEngine:
                     "direction": long_position.direction,
                     "entry_price": long_position.entry_price,
                     "qty": long_position.qty,
+                    "target_qty": long_position.target_qty,
+                    "part_qty": long_position.part_qty,
+                    "base_parts": long_position.base_parts,
+                    "parts_filled": long_position.parts_filled,
                     "leverage": long_position.leverage,
                     "stop_price": long_position.stop_price,
                     "prev_extreme_stop_price": long_position.prev_extreme_stop_price,
@@ -1462,6 +1698,10 @@ class BacktestEngine:
                     "direction": short_position.direction,
                     "entry_price": short_position.entry_price,
                     "qty": short_position.qty,
+                    "target_qty": short_position.target_qty,
+                    "part_qty": short_position.part_qty,
+                    "base_parts": short_position.base_parts,
+                    "parts_filled": short_position.parts_filled,
                     "leverage": short_position.leverage,
                     "stop_price": short_position.stop_price,
                     "prev_extreme_stop_price": short_position.prev_extreme_stop_price,
@@ -1538,6 +1778,8 @@ class BacktestEngine:
                 "stop_price": position.stop_price,
                 "rr_stop_price": position.rr_stop_price,
                 "rr_tp_price": position.rr_tp_price,
+                "auto_leverage_min_loss_applied": position.auto_leverage_min_loss_applied,
+                "auto_leverage_min_loss_multiplier": position.auto_leverage_min_loss_multiplier,
             }
         )
         if position.added_qty > 0:
@@ -1588,6 +1830,8 @@ class BacktestEngine:
                 "stop_price": position.stop_price,
                 "rr_stop_price": position.rr_stop_price,
                 "rr_tp_price": position.rr_tp_price,
+                "auto_leverage_min_loss_applied": position.auto_leverage_min_loss_applied,
+                "auto_leverage_min_loss_multiplier": position.auto_leverage_min_loss_multiplier,
             }
         )
         return cash

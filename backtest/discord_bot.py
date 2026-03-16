@@ -41,6 +41,8 @@ from backtest.realtime import RealtimeRunner, RunnerPayload, LiveOrderResult
 from backtest.strategy_loader import get_strategy_class, list_strategy_names
 from backtest.plot import (
     create_costom_loss_chart,
+    create_costom6_trade_return_extremes_chart,
+    create_costom6_holding_time_chart,
     create_equity_overlay_monthly_best_chart,
     create_equity_mdd_monthly_stats_chart,
     create_equity_price_chart,
@@ -50,6 +52,7 @@ from backtest.plot import (
     create_equity_price_mdd_chart,
     create_entry_minute_win_rate_chart,
     create_entry_minute_tp_rate_chart,
+    create_entry_elapsed_return_distribution_group_chart,
     create_tp_target_win_rate_chart,
     create_exit_reason_entry_feature_mean_chart,
     create_sl_target_win_rate_chart,
@@ -106,6 +109,13 @@ class PositionStatus:
     notional: float = 0.0
     qty: float = 0.0
     leverage: float = 1.0
+    entry_target_qty: Optional[float] = None
+    entry_remaining_qty: Optional[float] = None
+    planned_entry_qty: Optional[float] = None
+    planned_entry_target_qty: Optional[float] = None
+    planned_entry_usdt: Optional[float] = None
+    planned_entry_target_usdt: Optional[float] = None
+    planned_entry_parts: Optional[int] = None
     tp_pnl: Optional[float] = None
     sl_pnl: Optional[float] = None
     tp_price: Optional[float] = None
@@ -124,6 +134,8 @@ class StatusSnapshot:
     long: PositionStatus
     short: PositionStatus
     updated_at: float
+    engine_long: Optional[PositionStatus] = None
+    engine_short: Optional[PositionStatus] = None
 
 
 @dataclass
@@ -545,6 +557,113 @@ class LiveOrderModal(Modal):
         }
         await self.bot._handle_live_order(interaction, "", modal_fields=modal_fields)
 
+
+class LiveTestTargetModal(Modal):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        side: Optional[str],
+    ) -> None:
+        title = "Set Live Test TP/SL"
+        if side in {"long", "short"}:
+            title = f"Set Live Test TP/SL ({side})"
+        super().__init__(title=title)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.side = side
+        self.tp_pct = TextInput(
+            label="TP 수익률(레버리지 반영 %)",
+            placeholder="예: 10",
+            required=True,
+            max_length=10,
+        )
+        self.sl_pct = TextInput(
+            label="SL 수익률(레버리지 반영 %)",
+            placeholder="예: 10",
+            required=True,
+            max_length=10,
+        )
+        for item in (self.tp_pct, self.sl_pct):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can submit this form.",
+                ephemeral=True,
+            )
+            return
+        modal_fields = {
+            "tp_pct": self.tp_pct.value,
+            "sl_pct": self.sl_pct.value,
+        }
+        await self.bot._handle_livetest_settpsl(
+            interaction,
+            self.side,
+            modal_fields=modal_fields,
+        )
+
+
+class LiveTestTargetStartView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+        side: Optional[str],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.side = side
+        self.message: Optional[discord.Message] = None
+
+    @discord.ui.button(label="Open TP/SL Form", style=discord.ButtonStyle.primary)
+    async def open_form(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can open this form.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            LiveTestTargetModal(
+                self.bot,
+                self.requester_id,
+                self.side,
+            )
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can cancel this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
 
 class SettingOverwriteView(View):
     def __init__(
@@ -1231,6 +1350,130 @@ class LiveOrderConfirmView(View):
             await self.message.edit(view=self)
 
 
+class LiveOrderModeView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.message: Optional[discord.Message] = None
+
+    async def _apply_mode(
+        self,
+        interaction: discord.Interaction,
+        target: str,
+        mode: str,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can change order modes.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change live order modes.",
+                ephemeral=True,
+            )
+            return
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer()
+            except (discord.NotFound, discord.errors.NotFound, discord.HTTPException):
+                pass
+        ok, message = self.bot._apply_live_order_mode(target, mode)
+        if not ok:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+        content = f"{self.bot._live_order_mode_status_text()}\n선택: {message}"
+        try:
+            await interaction.edit_original_response(content=content, view=self)
+        except (discord.NotFound, discord.errors.NotFound):
+            if interaction.channel:
+                await interaction.channel.send(content, view=self)
+
+    @discord.ui.button(label="Open Maker", style=discord.ButtonStyle.primary, row=0)
+    async def open_maker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "open", "maker")
+
+    @discord.ui.button(label="Open Taker", style=discord.ButtonStyle.secondary, row=0)
+    async def open_taker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "open", "taker")
+
+    @discord.ui.button(label="Close Maker", style=discord.ButtonStyle.primary, row=1)
+    async def close_maker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "close", "maker")
+
+    @discord.ui.button(label="Close Taker", style=discord.ButtonStyle.secondary, row=1)
+    async def close_taker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "close", "taker")
+
+    @discord.ui.button(label="Both Maker", style=discord.ButtonStyle.primary, row=2)
+    async def both_maker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "both", "maker")
+
+    @discord.ui.button(label="Both Taker", style=discord.ButtonStyle.secondary, row=2)
+    async def both_taker(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await self._apply_mode(interaction, "both", "taker")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the requester can cancel this.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        if interaction.response.is_done():
+            await interaction.followup.send("Cancelled.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Cancelled.", ephemeral=True)
+        if self.message:
+            await self.message.edit(view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
 class ClosePositionSelect(discord.ui.Select):
     def __init__(
         self,
@@ -1539,7 +1782,12 @@ class BacktestDataSelect(Select):
         if err:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.response.defer(thinking=True)
+        except (discord.NotFound, discord.errors.NotFound):
+            return
+        except discord.InteractionResponded:
+            pass
         try:
             message, chart_paths = await self.bot._execute_backtest(
                 data_overrides,
@@ -1626,7 +1874,12 @@ class EntryDiffDataSelect(Select):
         if err:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.response.defer(thinking=True)
+        except (discord.NotFound, discord.errors.NotFound):
+            return
+        except discord.InteractionResponded:
+            pass
         try:
             message, chart_paths = await self.bot._execute_entry_diff(
                 data_overrides,
@@ -1753,7 +2006,12 @@ class RerunBacktestView(View):
         if err:
             await interaction.response.send_message(err, ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
+        try:
+            await interaction.response.defer(thinking=True)
+        except (discord.NotFound, discord.errors.NotFound):
+            return
+        except discord.InteractionResponded:
+            pass
         try:
             message, chart_paths = await self.bot._execute_backtest(
                 self.data_overrides,
@@ -2191,6 +2449,164 @@ class Costom4DataFileView(View):
     ) -> None:
         super().__init__(timeout=300)
         self.add_item(Costom4DataFileSelect(bot, files, tokens, requester_id))
+
+
+class Costom5DataFileSelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        files: List[str],
+        tokens: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.tokens = tokens
+        self.requester_id = requester_id
+        options = [
+            discord.SelectOption(
+                label="Default (use settings data.file_pattern)",
+                value="__default__",
+                default=True,
+            )
+        ]
+        for filename in files:
+            options.append(
+                discord.SelectOption(
+                    label=filename[:100],
+                    value=filename,
+                )
+            )
+        super().__init__(
+            placeholder="Select data file for costom5",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom5 run can select a data file.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can run backtests.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_backtest_channel(interaction.channel):
+            await interaction.response.send_message(
+                self.bot._backtest_channel_notice(),
+                ephemeral=True,
+            )
+            return
+
+        selected = self.values[0]
+        data_file = None if selected == "__default__" else selected
+        await self.bot._run_costom5_from_interaction(
+            interaction,
+            self.tokens,
+            data_file,
+        )
+
+
+class Costom5DataFileView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        files: List[str],
+        tokens: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(Costom5DataFileSelect(bot, files, tokens, requester_id))
+
+
+class Costom6DataFileSelect(Select):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        files: List[str],
+        tokens: List[str],
+        requester_id: int,
+    ) -> None:
+        self.bot = bot
+        self.tokens = tokens
+        self.requester_id = requester_id
+        options = [
+            discord.SelectOption(
+                label="Default (use settings data.file_pattern)",
+                value="__default__",
+                default=True,
+            )
+        ]
+        for filename in files:
+            options.append(
+                discord.SelectOption(
+                    label=filename[:100],
+                    value=filename,
+                )
+            )
+        super().__init__(
+            placeholder="Select data file for costom6",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom6 run can select a data file.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can run backtests.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_backtest_channel(interaction.channel):
+            await interaction.response.send_message(
+                self.bot._backtest_channel_notice(),
+                ephemeral=True,
+            )
+            return
+
+        selected = self.values[0]
+        data_file = None if selected == "__default__" else selected
+        await self.bot._run_costom6_from_interaction(
+            interaction,
+            self.tokens,
+            data_file,
+        )
+
+
+class Costom6DataFileView(View):
+    def __init__(
+        self,
+        bot: "BacktestBot",
+        files: List[str],
+        tokens: List[str],
+        requester_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(Costom6DataFileSelect(bot, files, tokens, requester_id))
 
 
 class Costom3DataFileSelect(Select):
@@ -2956,6 +3372,276 @@ class Costom3SetupView(View):
             return
 
         await self.bot._run_costom3_from_interaction(
+            interaction,
+            [self.var_key, *self.range],
+            self.data_file,
+        )
+
+    async def on_timeout(self) -> None:
+        self.select_data.disabled = True
+        self.select_var.disabled = True
+        self.prev_button.disabled = True
+        self.next_button.disabled = True
+        self.range_button.disabled = True
+        self.run_button.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class Costom5VariableSelect(Select):
+    def __init__(self, view: "Costom5SetupView") -> None:
+        self.costom5_view = view
+        super().__init__(
+            placeholder="Select variable",
+            min_values=1,
+            max_values=1,
+            options=view.options_for_page(),
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.costom5_view.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom5 can change selections.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        if not self.costom5_view.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can run backtests.",
+                ephemeral=True,
+            )
+            return
+        if not self.costom5_view.bot._is_backtest_channel(interaction.channel):
+            await interaction.response.send_message(
+                self.costom5_view.bot._backtest_channel_notice(),
+                ephemeral=True,
+            )
+            return
+
+        self.costom5_view.var_key = self.values[0]
+        await self.costom5_view.refresh_message(interaction)
+
+
+class Costom5DataSelect(Select):
+    def __init__(self, view: "Costom5SetupView") -> None:
+        self.costom5_view = view
+        super().__init__(
+            placeholder="Select data file (optional)",
+            min_values=1,
+            max_values=1,
+            options=view.data_options(),
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.costom5_view.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom5 can change selections.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        if not self.costom5_view.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can run backtests.",
+                ephemeral=True,
+            )
+            return
+        if not self.costom5_view.bot._is_backtest_channel(interaction.channel):
+            await interaction.response.send_message(
+                self.costom5_view.bot._backtest_channel_notice(),
+                ephemeral=True,
+            )
+            return
+
+        selected = self.values[0]
+        self.costom5_view.data_file = None if selected == "__default__" else selected
+        await self.costom5_view.refresh_message(interaction)
+
+
+class Costom5SetupView(View):
+    def __init__(self, bot: "BacktestBot", requester_id: int) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.requester_id = requester_id
+        self.keys = bot._grid_variable_keys()
+        self.page = 0
+        self.page_size = 24
+        self.data_file: Optional[str] = None
+        self.data_files = bot._list_price_files()
+        self.max_data_options = 24
+        self.var_key: Optional[str] = None
+        self.range: Optional[tuple[str, str, str]] = None
+        self.message: Optional[discord.Message] = None
+
+        self.select_data = Costom5DataSelect(self)
+        self.select_var = Costom5VariableSelect(self)
+        self.prev_button = Button(label="Prev vars", style=discord.ButtonStyle.secondary)
+        self.next_button = Button(label="Next vars", style=discord.ButtonStyle.secondary)
+        self.range_button = Button(label="Set range", style=discord.ButtonStyle.secondary)
+        self.run_button = Button(label="Run costom5", style=discord.ButtonStyle.primary)
+
+        self.prev_button.callback = self.prev_page
+        self.next_button.callback = self.next_page
+        self.range_button.callback = self.set_range
+        self.run_button.callback = self.run_costom5
+
+        self.add_item(self.select_data)
+        self.add_item(self.select_var)
+        self.add_item(self.prev_button)
+        self.add_item(self.next_button)
+        self.add_item(self.range_button)
+        self.add_item(self.run_button)
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        max_pages = max(1, (len(self.keys) - 1) // self.page_size + 1)
+        self.prev_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= max_pages - 1
+        self.run_button.disabled = self.var_key is None or self.range is None
+
+    def _page_keys(self) -> List[str]:
+        start = self.page * self.page_size
+        end = start + self.page_size
+        return self.keys[start:end]
+
+    def data_options(self) -> List[discord.SelectOption]:
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Default (use settings data.file_pattern)",
+                value="__default__",
+                default=self.data_file is None,
+            )
+        ]
+        for filename in self.data_files[: self.max_data_options]:
+            options.append(
+                discord.SelectOption(
+                    label=filename[:100],
+                    value=filename,
+                    default=self.data_file == filename,
+                )
+            )
+        if len(options) == 1:
+            options[0] = discord.SelectOption(
+                label="Default (no data files found)",
+                value="__default__",
+                default=True,
+            )
+        return options
+
+    def options_for_page(self) -> List[discord.SelectOption]:
+        options: List[discord.SelectOption] = []
+        for key in self._page_keys():
+            selected = self.var_key == key
+            options.append(
+                discord.SelectOption(
+                    label=key[:100],
+                    value=key,
+                    default=selected,
+                )
+            )
+        if not options:
+            options.append(
+                discord.SelectOption(label="No numeric variables", value="__none__")
+            )
+        return options
+
+    def _summary(self) -> str:
+        def fmt_range(value: Optional[tuple[str, str, str]]) -> str:
+            if not value:
+                return "not set"
+            return f"{value[0]} → {value[1]} (step {value[2]})"
+
+        data_label = self.data_file or "default (settings data.file_pattern)"
+        var_text = self.var_key or "not selected"
+        lines = [
+            "Select variable and range for costom5 backtest.",
+            f"- data file: {data_label}",
+            f"- variable: {var_text}",
+            f"- range: {fmt_range(self.range)}",
+        ]
+        if len(self.data_files) > self.max_data_options:
+            lines.append(
+                f"- data list truncated: showing {self.max_data_options}/{len(self.data_files)} "
+                "(use !data list or !costom5 --data FILENAME)"
+            )
+        return "\n".join(lines)
+
+    async def refresh_message(self, interaction: discord.Interaction) -> None:
+        self.select_data.options = self.data_options()
+        self.select_var.options = self.options_for_page()
+        self._update_buttons()
+        content = self._summary()
+        if interaction.message:
+            await interaction.response.edit_message(content=content, view=self)
+            return
+        await interaction.response.defer()
+        if self.message:
+            await self.message.edit(content=content, view=self)
+
+    async def prev_page(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+        await self.refresh_message(interaction)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        max_pages = max(1, (len(self.keys) - 1) // self.page_size + 1)
+        if self.page < max_pages - 1:
+            self.page += 1
+        await self.refresh_message(interaction)
+
+    async def set_range(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom5 can change ranges.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(CompRangeModal(self))
+
+    async def run_costom5(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the user who requested the costom5 can run it.",
+                ephemeral=True,
+            )
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_guild_owner(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can run backtests.",
+                ephemeral=True,
+            )
+            return
+        if not self.bot._is_backtest_channel(interaction.channel):
+            await interaction.response.send_message(
+                self.bot._backtest_channel_notice(),
+                ephemeral=True,
+            )
+            return
+        if self.var_key is None or self.range is None:
+            await interaction.response.send_message(
+                "Select a variable and set its range first.",
+                ephemeral=True,
+            )
+            return
+
+        await self.bot._run_costom5_from_interaction(
             interaction,
             [self.var_key, *self.range],
             self.data_file,
@@ -4180,6 +4866,8 @@ class BacktestBot(commands.Bot):
             commands.Command(costom2_text_command, name="costom2"),
             commands.Command(costom3_text_command, name="costom3"),
             commands.Command(costom4_text_command, name="costom4"),
+            commands.Command(costom5_text_command, name="costom5"),
+            commands.Command(costom6_text_command, name="costom6"),
             commands.Command(chart_text_command, name="chart"),
             commands.Command(graph_text_command, name="graph"),
             commands.Command(stge_text_command, name="stge"),
@@ -4656,6 +5344,13 @@ class BacktestBot(commands.Bot):
 
     def _ensure_live_runner_for_test(self) -> Optional[RealtimeRunner]:
         if self.live_runner is not None:
+            cfg = self._get_realtime_cfg("live")
+            self.live_runner.live_order_mode_open = self.live_runner._normalize_live_order_mode(
+                self._resolve_live_order_mode_cfg(cfg, "order_mode_open", "order_mode_buy")
+            )
+            self.live_runner.live_order_mode_close = self.live_runner._normalize_live_order_mode(
+                self._resolve_live_order_mode_cfg(cfg, "order_mode_close", "order_mode_sell")
+            )
             return self.live_runner
         runner = self._build_realtime_runner("live")
         if runner is None:
@@ -4673,6 +5368,7 @@ class BacktestBot(commands.Bot):
             "equity": payload.equity,
             "free_balance": payload.free_balance,
             "positions": payload.positions,
+            "engine_positions": payload.engine_positions,
             "updated_at": payload.updated_at,
         }
         return self._parse_status_snapshot(payload_dict)
@@ -4885,6 +5581,32 @@ class BacktestBot(commands.Bot):
         pnl_amount = self._parse_float(
             data.get("pnl_amount", data.get("pnl_usdt", data.get("pnl_value", 0.0)))
         )
+        entry_target_qty = self._parse_float(data.get("entry_target_qty", data.get("target_qty")))
+        entry_remaining_qty = self._parse_float(
+            data.get("entry_remaining_qty", data.get("remaining_qty"))
+        )
+        if entry_remaining_qty is None and entry_target_qty is not None and entry_target_qty > 0:
+            entry_remaining_qty = max(entry_target_qty - abs(qty), 0.0)
+        planned_entry_qty = self._parse_float(data.get("planned_entry_qty", data.get("planned_qty")))
+        planned_entry_target_qty = self._parse_float(
+            data.get("planned_entry_target_qty", data.get("planned_target_qty"))
+        )
+        planned_entry_usdt = self._parse_float(
+            data.get("planned_entry_usdt", data.get("planned_entry_notional"))
+        )
+        planned_entry_target_usdt = self._parse_float(
+            data.get("planned_entry_target_usdt", data.get("planned_target_notional"))
+        )
+        if planned_entry_usdt is None and planned_entry_qty is not None and price:
+            planned_entry_usdt = planned_entry_qty * price
+        if planned_entry_target_usdt is None and planned_entry_target_qty is not None and price:
+            planned_entry_target_usdt = planned_entry_target_qty * price
+        planned_entry_parts = data.get("planned_entry_parts", data.get("planned_parts"))
+        if planned_entry_parts is not None:
+            try:
+                planned_entry_parts = int(planned_entry_parts)
+            except (TypeError, ValueError):
+                planned_entry_parts = None
         active = bool(
             data.get("active", data.get("open", data.get("in_position", False)))
             or qty > 0
@@ -4896,6 +5618,13 @@ class BacktestBot(commands.Bot):
             notional=notional,
             qty=qty,
             leverage=leverage if leverage > 0 else 1.0,
+            entry_target_qty=entry_target_qty,
+            entry_remaining_qty=entry_remaining_qty,
+            planned_entry_qty=planned_entry_qty,
+            planned_entry_target_qty=planned_entry_target_qty,
+            planned_entry_usdt=planned_entry_usdt,
+            planned_entry_target_usdt=planned_entry_target_usdt,
+            planned_entry_parts=planned_entry_parts,
             tp_pnl=self._resolve_target_pnl(entry_price, tp_price, direction, leverage, tp_pnl),
             sl_pnl=self._resolve_target_pnl(entry_price, sl_price, direction, leverage, sl_pnl),
             tp_price=self._parse_float(tp_price) if tp_price is not None else None,
@@ -4927,6 +5656,14 @@ class BacktestBot(commands.Bot):
         long_status = self._parse_position_status(payload, "long", price)
         short_status = self._parse_position_status(payload, "short", price)
 
+        engine_long = None
+        engine_short = None
+        engine_positions = payload.get("engine_positions")
+        if isinstance(engine_positions, dict):
+            engine_payload = {"positions": engine_positions}
+            engine_long = self._parse_position_status(engine_payload, "long", price)
+            engine_short = self._parse_position_status(engine_payload, "short", price)
+
         return StatusSnapshot(
             symbol=symbol,
             interval=interval,
@@ -4935,8 +5672,32 @@ class BacktestBot(commands.Bot):
             free_balance=free_balance,
             long=long_status,
             short=short_status,
+            engine_long=engine_long,
+            engine_short=engine_short,
             updated_at=updated_ts,
         )
+
+    def _positions_aligned_for_restart(self, runner: Optional[RealtimeRunner]) -> Optional[bool]:
+        if runner is None:
+            return None
+        payload = runner.latest_payload
+        if payload is None:
+            return None
+        if not isinstance(payload.positions, dict) or not isinstance(payload.engine_positions, dict):
+            return None
+        price = float(payload.price or 0.0)
+        exchange_payload = {"positions": payload.positions}
+        engine_payload = {"positions": payload.engine_positions}
+        for side in ("long", "short"):
+            exchange_status = self._parse_position_status(exchange_payload, side, price)
+            engine_status = self._parse_position_status(engine_payload, side, price)
+            if exchange_status.active != engine_status.active:
+                return False
+            if exchange_status.active:
+                qty_diff = abs((exchange_status.qty or 0.0) - (engine_status.qty or 0.0))
+                if qty_diff > 1e-6:
+                    return False
+        return True
 
     def _runner_status_text(self, group: str) -> str:
         if group == "sim":
@@ -5046,6 +5807,16 @@ class BacktestBot(commands.Bot):
                 return "n/a"
             return f"{value:+.2f}%"
 
+        def fmt_qty_optional(value: Optional[float]) -> str:
+            if value is None:
+                return "n/a"
+            return f"{value:.6g}"
+
+        def fmt_usdt_optional(value: Optional[float]) -> str:
+            if value is None:
+                return "n/a"
+            return f"{fmt_money(value)} USDT"
+
         def fmt_roi(initial_balance: float, equity: float) -> str:
             if initial_balance <= 0:
                 return "n/a"
@@ -5058,6 +5829,38 @@ class BacktestBot(commands.Bot):
             if price_value is None:
                 return pnl_text
             return f"{pnl_text} ({self._fmt_price(price_value)})"
+
+        def fmt_planned(status: PositionStatus) -> str:
+            if status.planned_entry_usdt is None and status.planned_entry_target_usdt is None:
+                return "n/a"
+            plan = f"{fmt_money(status.planned_entry_usdt)} USDT"
+            if (
+                status.planned_entry_target_usdt is not None
+                and status.planned_entry_target_usdt > 0
+            ):
+                plan = f"{plan} / 목표 {fmt_money(status.planned_entry_target_usdt)} USDT"
+            if status.planned_entry_parts is not None and status.planned_entry_parts > 1:
+                plan = f"{plan} (분할 {status.planned_entry_parts}파트)"
+            return plan
+
+        def position_summary(status: PositionStatus) -> str:
+            return (
+                f"{'보유중' if status.active else '미보유'} | "
+                f"수량 {status.qty:.6g} | "
+                f"금액 {fmt_money(status.notional)} | "
+                f"레버리지 {status.leverage:.2f}x"
+            )
+
+        def position_detail(status: PositionStatus, label: Optional[str]) -> str:
+            prefix = f"{label} " if label else ""
+            return (
+                f"{prefix}{'보유중' if status.active else '미보유'}\n"
+                f"수량 {status.qty:.6g} | 금액 {fmt_money(status.notional)}\n"
+                f"레버리지 {status.leverage:.2f}x\n"
+                f"TP {fmt_target(status.tp_pnl, status.tp_price)} | "
+                f"SL {fmt_target(status.sl_pnl, status.sl_price)}\n"
+                f"수익률 {fmt_pct(status.pnl_pct)} | 수익금 {fmt_money(status.pnl_amount)}"
+            )
 
         updated = ""
         if snapshot.updated_at > 0:
@@ -5083,6 +5886,11 @@ class BacktestBot(commands.Bot):
             ),
             inline=True,
         )
+        def planned_entry_line(status: PositionStatus) -> str:
+            if status.active:
+                return "신규 진입 예정 n/a"
+            return f"신규 진입 예정 {fmt_planned(status)}"
+
         if group == "sim":
             initial_balance = self._sim_initial_balance()
             roi_text = fmt_roi(initial_balance, snapshot.equity)
@@ -5104,27 +5912,26 @@ class BacktestBot(commands.Bot):
                 f"총 {fmt_money(snapshot.equity)}\n"
                 f"가용 {fmt_money(snapshot.free_balance)}"
             )
+        asset_value = (
+            f"{asset_value}\n"
+            f"롱 {planned_entry_line(snapshot.long)}\n"
+            f"숏 {planned_entry_line(snapshot.short)}"
+        )
         embed.add_field(name="자산", value=asset_value, inline=True)
         embed.add_field(name="봇 상태", value=status_text, inline=True)
 
         long = snapshot.long
-        long_value = (
-            f"{'보유중' if long.active else '미보유'}\n"
-            f"수량 {long.qty:.6g} | 금액 {fmt_money(long.notional)}\n"
-            f"레버리지 {long.leverage:.2f}x\n"
-            f"TP {fmt_target(long.tp_pnl, long.tp_price)} | SL {fmt_target(long.sl_pnl, long.sl_price)}\n"
-            f"수익률 {fmt_pct(long.pnl_pct)} | 수익금 {fmt_money(long.pnl_amount)}"
-        )
+        exchange_label = "거래소" if group == "live" and snapshot.engine_long is not None else None
+        long_value = position_detail(long, exchange_label)
+        if snapshot.engine_long is not None:
+            long_value = f"{long_value}\n엔진 {position_summary(snapshot.engine_long)}"
         embed.add_field(name="🟢 롱", value=long_value, inline=False)
 
         short = snapshot.short
-        short_value = (
-            f"{'보유중' if short.active else '미보유'}\n"
-            f"수량 {short.qty:.6g} | 금액 {fmt_money(short.notional)}\n"
-            f"레버리지 {short.leverage:.2f}x\n"
-            f"TP {fmt_target(short.tp_pnl, short.tp_price)} | SL {fmt_target(short.sl_pnl, short.sl_price)}\n"
-            f"수익률 {fmt_pct(short.pnl_pct)} | 수익금 {fmt_money(short.pnl_amount)}"
-        )
+        exchange_label = "거래소" if group == "live" and snapshot.engine_short is not None else None
+        short_value = position_detail(short, exchange_label)
+        if snapshot.engine_short is not None:
+            short_value = f"{short_value}\n엔진 {position_summary(snapshot.engine_short)}"
         embed.add_field(name="🔴 숏", value=short_value, inline=False)
 
         if updated:
@@ -5179,7 +5986,9 @@ class BacktestBot(commands.Bot):
                 self.live_runner = runner
                 runner.start()
 
-    def _build_realtime_runner(self, group: str) -> Optional[RealtimeRunner]:
+    def _build_realtime_runner(
+        self, group: str, reset_engine_positions: bool = False
+    ) -> Optional[RealtimeRunner]:
         cfg = self.sim_cfg if group == "sim" else self.live_cfg
         if not isinstance(cfg, dict):
             cfg = {}
@@ -5230,6 +6039,12 @@ class BacktestBot(commands.Bot):
             max_history = _as_int(max_history, 0)
         maker_offset_bps = _as_float(cfg.get("maker_offset_bps", 1.0), 1.0)
         maker_aggressive_ticks = _as_int(cfg.get("maker_aggressive_ticks", 0), 0)
+        order_mode_open = self._resolve_live_order_mode_cfg(
+            cfg, "order_mode_open", "order_mode_buy"
+        )
+        order_mode_close = self._resolve_live_order_mode_cfg(
+            cfg, "order_mode_close", "order_mode_sell"
+        )
         auto_trade = bool(cfg.get("auto_trade", False))
         if group != "live":
             if auto_trade:
@@ -5241,6 +6056,12 @@ class BacktestBot(commands.Bot):
         sync_exchange_positions = bool(cfg.get("sync_exchange_positions", group == "live"))
         sync_interval_seconds = _as_float(cfg.get("sync_interval_seconds", 10.0), 10.0)
         sync_history_path = cfg.get("sync_history_path")
+        exchange_position_authority = bool(
+            cfg.get(
+                "exchange_position_authority",
+                sync_exchange_positions and group == "live",
+            )
+        )
         live_order_retry_seconds = _as_float(cfg.get("live_order_retry_seconds", 20.0), 20.0)
         live_order_retry_max_seconds = _as_float(
             cfg.get("live_order_retry_max_seconds", 180.0), 180.0
@@ -5416,12 +6237,16 @@ class BacktestBot(commands.Bot):
             sync_exchange_positions=sync_exchange_positions,
             sync_interval_seconds=sync_interval_seconds,
             sync_history_path=sync_history_path,
+            exchange_position_authority=exchange_position_authority,
             live_order_retry_seconds=live_order_retry_seconds,
             live_order_retry_max_seconds=live_order_retry_max_seconds,
             live_order_max_attempts=live_order_max_attempts,
+            live_order_mode_open=order_mode_open,
+            live_order_mode_close=order_mode_close,
             dual_side_position=dual_side_position,
             state_path=state_path,
             persist_seen_limit=persist_seen_limit,
+            reset_engine_positions=reset_engine_positions,
             on_trade=on_trade,
             on_payload=on_payload,
             on_order=on_order,
@@ -5453,6 +6278,9 @@ class BacktestBot(commands.Bot):
         await self._send_live_order_log(trade, result)
         if result.success:
             return
+        status_key = str(result.status or "").lower()
+        if status_key in {"submitted", "retrying", "canceled"}:
+            return
         channel = await self._get_or_create_group_channel(
             group, self._group_channel_name(group, "status")
         )
@@ -5460,8 +6288,8 @@ class BacktestBot(commands.Bot):
             return
         direction = int(trade.get("direction", 0) or 0)
         side = "롱" if direction > 0 else "숏"
-        emoji = "🟠" if result.status in {"submitted", "not_filled"} else "🔴"
-        color = discord.Color.orange() if result.status in {"submitted", "not_filled"} else discord.Color.red()
+        emoji = "🟠" if status_key in {"submitted", "not_filled"} else "🔴"
+        color = discord.Color.orange() if status_key in {"submitted", "not_filled"} else discord.Color.red()
         trade_type = str(trade.get("type", "")).lower()
         action = {
             "entry": "진입",
@@ -6499,7 +7327,118 @@ class BacktestBot(commands.Bot):
             self.live_cfg = cfg
         return cfg
 
-    def _apply_backtest_settings_to_realtime(
+    def _live_order_mode_status_text(self) -> str:
+        cfg = self._get_realtime_cfg("live")
+        current_open = self._resolve_live_order_mode_cfg(
+            cfg, "order_mode_open", "order_mode_buy"
+        )
+        current_close = self._resolve_live_order_mode_cfg(
+            cfg, "order_mode_close", "order_mode_sell"
+        )
+        return (
+            "현재 live 주문 타입: "
+            f"open={current_open}, close={current_close}"
+        )
+
+    def _apply_live_order_mode(self, target: str, mode: str) -> Tuple[bool, str]:
+        mode_text = str(mode or "").strip().lower()
+        if mode_text not in {"maker", "taker"}:
+            return False, "주문 타입은 maker 또는 taker여야 해요."
+        target_text = str(target or "").strip().lower()
+        if target_text in {"open", "entry"}:
+            key_targets = ("order_mode_open",)
+        elif target_text in {"close", "exit"}:
+            key_targets = ("order_mode_close",)
+        elif target_text in {"both", "all"}:
+            key_targets = ("order_mode_open", "order_mode_close")
+        else:
+            return False, "대상은 open, close, 또는 both여야 해요."
+
+        cfg = self._get_realtime_cfg("live")
+        for key in key_targets:
+            cfg[key] = mode_text
+        if "order_mode_buy" in cfg:
+            cfg["order_mode_buy"] = cfg.get("order_mode_open", mode_text)
+        if "order_mode_sell" in cfg:
+            cfg["order_mode_sell"] = cfg.get("order_mode_close", mode_text)
+        save_settings(self.settings_path, self.settings)
+        runner = self._runner_for_group("live")
+        if runner is not None:
+            runner.live_order_mode_open = runner._normalize_live_order_mode(
+                self._resolve_live_order_mode_cfg(cfg, "order_mode_open", "order_mode_buy")
+            )
+            runner.live_order_mode_close = runner._normalize_live_order_mode(
+                self._resolve_live_order_mode_cfg(cfg, "order_mode_close", "order_mode_sell")
+            )
+        return (
+            True,
+            "live 주문 타입 업데이트: "
+            f"open={cfg.get('order_mode_open')} "
+            f"close={cfg.get('order_mode_close')}",
+        )
+
+    @staticmethod
+    def _resolve_live_order_mode_cfg(
+        cfg: Dict[str, Any],
+        key: str,
+        legacy_key: str,
+    ) -> str:
+        value = cfg.get(key)
+        if not value:
+            value = cfg.get(legacy_key)
+        return str(value or "maker")
+
+    @staticmethod
+    def _normalize_position_snapshot(
+        positions: Optional[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        snapshot: Dict[str, Dict[str, Any]] = {"long": {}, "short": {}}
+        if not isinstance(positions, dict):
+            return snapshot
+        for side in ("long", "short"):
+            raw = positions.get(side)
+            if isinstance(raw, dict) and raw:
+                snapshot[side] = dict(raw)
+        return snapshot
+
+    @staticmethod
+    def _write_state_snapshot(
+        state_path: str,
+        *,
+        group: str,
+        payload: RunnerPayload,
+    ) -> None:
+        data: Dict[str, Any] = {
+            "version": 1,
+            "group": group,
+            "symbol": payload.symbol,
+            "interval": payload.interval,
+            "emit_after_ts": None,
+            "last_emitted_ts": None,
+            "seen_trades": [],
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot": {
+                "symbol": payload.symbol,
+                "interval": payload.interval,
+                "price": payload.price,
+                "equity": payload.equity,
+                "free_balance": payload.free_balance,
+                "positions": payload.positions,
+                "engine_positions": payload.engine_positions,
+                "updated_at": payload.updated_at,
+            },
+        }
+        path = Path(state_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=True, sort_keys=True)
+            tmp_path.replace(path)
+        except Exception:
+            return
+
+    def _apply_backtest_settings_to_realtime_group(
         self, group: str
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         cfg = self._get_realtime_cfg(group)
@@ -6534,8 +7473,19 @@ class BacktestBot(commands.Bot):
             "strategy_params_keys": sorted(strategy_params.keys()) if isinstance(strategy_params, dict) else [],
             "data_keys": sorted(data_cfg.keys()),
         }
-        save_settings(self.settings_path, self.settings)
         return applied, summary
+
+    def _apply_backtest_settings_to_realtime(
+        self, group: str
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        applied_map: Dict[str, Dict[str, Any]] = {}
+        summary_map: Dict[str, Dict[str, Any]] = {}
+        for target_group in ("sim", "live"):
+            applied, summary = self._apply_backtest_settings_to_realtime_group(target_group)
+            applied_map[target_group] = applied
+            summary_map[target_group] = summary
+        save_settings(self.settings_path, self.settings)
+        return applied_map, summary_map
 
     def _get_live_client(self) -> tuple[Optional[BinanceFuturesClient], Optional[str]]:
         cfg = self._get_realtime_cfg("live")
@@ -6853,6 +7803,14 @@ class BacktestBot(commands.Bot):
         return "reduceonly" in text and "not required" in text
 
     @classmethod
+    def _is_reduce_only_rejected(cls, exc: Exception) -> bool:
+        code, msg, body = cls._extract_binance_error(exc)
+        if code == -2022:
+            return True
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        return "reduceonly" in text and "rejected" in text
+
+    @classmethod
     def _is_filter_error(cls, exc: Exception) -> bool:
         code, msg, body = cls._extract_binance_error(exc)
         if code in {-1013, -4016, -1111, -4164}:
@@ -6869,6 +7827,14 @@ class BacktestBot(commands.Bot):
             or "limit price can't be higher" in text
             or "limit price can't be lower" in text
         )
+
+    @classmethod
+    def _is_position_side_mismatch(cls, exc: Exception) -> bool:
+        code, msg, body = cls._extract_binance_error(exc)
+        if code == -4061:
+            return True
+        text = " ".join(part for part in [msg or "", body or "", str(exc)] if part).lower()
+        return "position side" in text and "does not match" in text
 
     @classmethod
     def _extract_limit_price_bound(
@@ -6899,7 +7865,7 @@ class BacktestBot(commands.Bot):
         self,
         client: BinanceFuturesClient,
         symbol: str,
-    ) -> Tuple[List[str], bool, bool]:
+    ) -> Tuple[List[str], bool, bool, Optional[bool]]:
         def _is_noop_position_mode(exc: Exception) -> bool:
             code, msg, body = self._extract_binance_error(exc)
             if code in {-4059}:
@@ -6930,12 +7896,15 @@ class BacktestBot(commands.Bot):
 
         notes: List[str] = []
         hedge_ok = False
+        dual_side_position: Optional[bool] = None
         try:
             await asyncio.to_thread(client.set_position_mode, True)
             hedge_ok = True
+            dual_side_position = True
         except Exception as exc:
             if _is_noop_position_mode(exc):
                 hedge_ok = True
+                dual_side_position = True
             else:
                 try:
                     payload = await asyncio.to_thread(client.get_position_mode)
@@ -6943,6 +7912,9 @@ class BacktestBot(commands.Bot):
                     payload = None
                 if isinstance(payload, dict) and payload.get("dualSidePosition") is True:
                     hedge_ok = True
+                    dual_side_position = True
+                elif isinstance(payload, dict) and payload.get("dualSidePosition") is False:
+                    dual_side_position = False
                 else:
                     notes.append(
                         f"Failed to set hedge mode: {self._format_binance_error(exc)}"
@@ -6970,7 +7942,7 @@ class BacktestBot(commands.Bot):
                     notes.append(
                         f"Failed to set isolated margin: {self._format_binance_error(exc)}"
                     )
-        return notes, hedge_ok, isolated_ok
+        return notes, hedge_ok, isolated_ok, dual_side_position
 
     async def _place_limit_maker_with_retry(
         self,
@@ -6981,6 +7953,7 @@ class BacktestBot(commands.Bot):
         base_price: float,
         reduce_only: bool,
         position_side: str,
+        allow_position_side_fallback: bool,
         maker_offset_bps: float,
         maker_aggressive_ticks: int,
         retry_seconds: float,
@@ -7013,6 +7986,12 @@ class BacktestBot(commands.Bot):
         forced_min_price: Optional[float] = None
         forced_max_price: Optional[float] = None
         reduce_only_param = reduce_only
+        position_side_param = position_side
+        position_side_fallback_used = False
+        position_side_note = "Position side mismatch; retried in one-way mode."
+        position_side_block_note = (
+            "Position side mismatch; verify account mode (HEDGE vs ONE-WAY)."
+        )
         while remaining_qty > 0:
             attempt += 1
             if max_attempts > 0 and attempt > max_attempts:
@@ -7076,9 +8055,24 @@ class BacktestBot(commands.Bot):
                     qty_param,
                     price_param,
                     reduce_only_param,
-                    position_side,
+                    position_side_param,
                 )
             except Exception as exc:
+                if position_side_param and self._is_position_side_mismatch(exc):
+                    if allow_position_side_fallback:
+                        position_side_param = None
+                        position_side_fallback_used = True
+                        last_error_note = f"Order failed: {self._format_binance_error(exc)}"
+                        continue
+                    return {
+                        "filled": False,
+                        "remaining_qty": remaining_qty,
+                        "order_id": last_order_id,
+                        "note": (
+                            f"Order failed: {self._format_binance_error(exc)}. "
+                            f"{position_side_block_note}"
+                        ),
+                    }
                 bound_min, bound_max = self._extract_limit_price_bound(exc)
                 if bound_min is not None or bound_max is not None:
                     if bound_min is not None:
@@ -7095,6 +8089,15 @@ class BacktestBot(commands.Bot):
                     )
                     last_error_note = f"Order failed: {self._format_binance_error(exc)}"
                     continue
+                if self._is_reduce_only_rejected(exc):
+                    return {
+                        "filled": False,
+                        "remaining_qty": remaining_qty,
+                        "order_id": last_order_id,
+                        "note": (
+                            "ReduceOnly rejected: no open position to close on the exchange."
+                        ),
+                    }
                 if self._is_reduce_only_not_required(exc) and reduce_only_param:
                     reduce_only_param = False
                     last_error_note = f"Order failed: {self._format_binance_error(exc)}"
@@ -7135,11 +8138,14 @@ class BacktestBot(commands.Bot):
             order_id = order.get("orderId") if isinstance(order, dict) else None
             last_order_id = order_id
             if retry_seconds <= 0 or order_id is None:
+                note = "Order placed (status unknown; retry disabled)."
+                if position_side_fallback_used:
+                    note = f"{note} {position_side_note}"
                 return {
                     "filled": True,
                     "remaining_qty": remaining_qty,
                     "order_id": order_id,
-                    "note": "Order placed (status unknown; retry disabled).",
+                    "note": note,
                 }
 
             await asyncio.sleep(retry_seconds)
@@ -7162,11 +8168,12 @@ class BacktestBot(commands.Bot):
                 }
 
             if status == "FILLED":
+                note = position_side_note if position_side_fallback_used else None
                 return {
                     "filled": True,
                     "remaining_qty": 0.0,
                     "order_id": order_id,
-                    "note": None,
+                    "note": note,
                 }
 
             try:
@@ -7181,7 +8188,9 @@ class BacktestBot(commands.Bot):
             "filled": False,
             "remaining_qty": remaining_qty,
             "order_id": last_order_id,
-            "note": last_error_note or "Order not fully filled after retries.",
+            "note": last_error_note
+            or (f"{position_side_note} Order not fully filled after retries." if position_side_fallback_used else None)
+            or "Order not fully filled after retries.",
         }
 
     async def _execute_live_order(
@@ -7223,7 +8232,9 @@ class BacktestBot(commands.Bot):
         retry_seconds = float(cfg.get("live_order_retry_seconds", 20.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
-        notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        notes, hedge_ok, _, dual_side_position = await self._ensure_hedge_and_isolated(
+            client, draft.symbol
+        )
         if not hedge_ok:
             extra = f"\nNote: {' | '.join(notes)}" if notes else ""
             await _send(
@@ -7282,6 +8293,7 @@ class BacktestBot(commands.Bot):
             base_price=draft.price,
             reduce_only=draft.reduce_only,
             position_side=draft.position_side,
+            allow_position_side_fallback=bool(dual_side_position is False),
             maker_offset_bps=draft.maker_offset_bps,
             maker_aggressive_ticks=draft.maker_aggressive_ticks,
             retry_seconds=retry_seconds,
@@ -7351,7 +8363,9 @@ class BacktestBot(commands.Bot):
         retry_seconds = float(cfg.get("live_order_retry_seconds", 20.0) or 0.0)
         max_attempts = int(cfg.get("live_order_max_attempts", 0) or 0)
 
-        notes, hedge_ok, _ = await self._ensure_hedge_and_isolated(client, draft.symbol)
+        notes, hedge_ok, _, dual_side_position = await self._ensure_hedge_and_isolated(
+            client, draft.symbol
+        )
         if not hedge_ok:
             extra = f"\nNote: {' | '.join(notes)}" if notes else ""
             await _send(
@@ -7369,6 +8383,7 @@ class BacktestBot(commands.Bot):
             base_price=draft.price,
             reduce_only=True,
             position_side=draft.position_side,
+            allow_position_side_fallback=bool(dual_side_position is False),
             maker_offset_bps=draft.maker_offset_bps,
             maker_aggressive_ticks=draft.maker_aggressive_ticks,
             retry_seconds=retry_seconds,
@@ -7430,7 +8445,9 @@ class BacktestBot(commands.Bot):
         if runner is not None:
             runner.stop()
 
-    def _start_realtime_runner(self, group: str) -> Optional[str]:
+    def _start_realtime_runner(
+        self, group: str, reset_engine_positions: bool = False
+    ) -> Optional[str]:
         if group == "sim":
             if self.sim_runner is not None:
                 self.sim_runner.start()
@@ -7439,7 +8456,7 @@ class BacktestBot(commands.Bot):
             if self.live_runner is not None:
                 self.live_runner.start()
                 return None
-        runner = self._build_realtime_runner(group)
+        runner = self._build_realtime_runner(group, reset_engine_positions=reset_engine_positions)
         if runner is None:
             return "Failed to start runner (missing config or credentials)."
         if group == "sim":
@@ -7708,6 +8725,51 @@ class BacktestBot(commands.Bot):
                         "stats": result.stats(),
                     }
                 )
+            except Exception as exc:
+                results.append({"value": value1, "error": f"{type(exc).__name__}"})
+            completed += 1
+            if progress_cb:
+                progress_cb(completed, total)
+        return results
+
+    def _run_costom5_backtests(
+        self,
+        base_settings: Settings,
+        var1: dict,
+        values1: List[Any],
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        total_runs: Optional[int] = None,
+    ) -> List[dict]:
+        results: List[dict] = []
+        total = total_runs or len(values1)
+        completed = 0
+        if progress_cb:
+            progress_cb(0, total)
+        for value1 in values1:
+            settings_copy = copy.deepcopy(base_settings)
+            applied = self._apply_setting_value_to(
+                settings_copy,
+                var1["section"],
+                var1["key"],
+                value1,
+                var1["index"],
+            )
+            if not applied:
+                results.append({"value": value1, "error": "Failed to apply setting"})
+                completed += 1
+                if progress_cb:
+                    progress_cb(completed, total)
+                continue
+            chart_cfg = settings_copy.backtest.get("chart")
+            if isinstance(chart_cfg, dict):
+                chart_cfg = dict(chart_cfg)
+                chart_cfg["enabled"] = False
+            else:
+                chart_cfg = {"enabled": False}
+            settings_copy.backtest["chart"] = chart_cfg
+            try:
+                _, _, _, result, _ = run_backtest_with_result(settings_copy)
+                results.append({"value": value1, "result": result})
             except Exception as exc:
                 results.append({"value": value1, "error": f"{type(exc).__name__}"})
             completed += 1
@@ -8064,6 +9126,11 @@ class BacktestBot(commands.Bot):
     def _grid_variable_keys(self) -> List[str]:
         optional_numeric_keys = {
             "strategy.params.auto_leverage_max_loss_pnl",
+            "strategy.params.auto_leverage_min_loss_multiplier",
+            "strategy.params.auto_leverage_sl_min_pct",
+            "strategy.params.auto_leverage_sl_max_pct",
+            "strategy.params.auto_leverage_sl_min_multiplier",
+            "strategy.params.auto_leverage_sl_max_multiplier",
         }
         keys: List[str] = []
         for full_key, value in self._flatten_settings():
@@ -8075,6 +9142,20 @@ class BacktestBot(commands.Bot):
         params = self.settings.strategy.setdefault("params", {})
         if "auto_leverage_max_loss_pnl" not in params:
             params["auto_leverage_max_loss_pnl"] = None
+        if "use_auto_leverage_min_loss_multiplier" not in params:
+            params["use_auto_leverage_min_loss_multiplier"] = False
+        if "auto_leverage_min_loss_multiplier" not in params:
+            params["auto_leverage_min_loss_multiplier"] = None
+        if "use_auto_leverage_sl_multiplier" not in params:
+            params["use_auto_leverage_sl_multiplier"] = True
+        if "auto_leverage_sl_min_pct" not in params:
+            params["auto_leverage_sl_min_pct"] = None
+        if "auto_leverage_sl_max_pct" not in params:
+            params["auto_leverage_sl_max_pct"] = None
+        if "auto_leverage_sl_min_multiplier" not in params:
+            params["auto_leverage_sl_min_multiplier"] = None
+        if "auto_leverage_sl_max_multiplier" not in params:
+            params["auto_leverage_sl_max_multiplier"] = None
 
     @staticmethod
     def _parse_costom_params(
@@ -8350,6 +9431,100 @@ class BacktestBot(commands.Bot):
             if chart_path:
                 chart_paths.append(chart_path)
         return chart_paths
+
+    @staticmethod
+    def _is_tp_reason(reason: Any) -> bool:
+        if reason is None:
+            return False
+        text = str(reason).lower()
+        return "take_profit" in text or "rr_tp" in text
+
+    @staticmethod
+    def _is_sl_reason(reason: Any) -> bool:
+        if reason is None:
+            return False
+        text = str(reason).lower()
+        if "slope" in text:
+            return False
+        return "stop" in text or text == "sl" or "sl_" in text or "_sl" in text
+
+    @staticmethod
+    def _compute_costom6_stats(
+        result: BacktestResult,
+    ) -> Dict[str, Any]:
+        exit_trades = [
+            trade
+            for trade in result.trades
+            if trade.get("type") == "exit"
+            and trade.get("auto_leverage_min_loss_applied")
+        ]
+        total = int(len(exit_trades))
+        win_count = int(
+            sum(1 for trade in exit_trades if float(trade.get("pnl", 0.0)) > 0.0)
+        )
+        tp_count = int(
+            sum(
+                1
+                for trade in exit_trades
+                if BacktestBot._is_tp_reason(trade.get("exit_reason"))
+            )
+        )
+        sl_count = int(
+            sum(
+                1
+                for trade in exit_trades
+                if BacktestBot._is_sl_reason(trade.get("exit_reason"))
+            )
+        )
+        other_count = max(0, total - tp_count - sl_count)
+        win_rate = float(win_count) / float(total) * 100.0 if total > 0 else 0.0
+        tp_rate = float(tp_count) / float(total) * 100.0 if total > 0 else 0.0
+        sl_rate = float(sl_count) / float(total) * 100.0 if total > 0 else 0.0
+        other_rate = float(other_count) / float(total) * 100.0 if total > 0 else 0.0
+        return {
+            "trades": exit_trades,
+            "total": total,
+            "wins": win_count,
+            "win_rate": win_rate,
+            "tp_count": tp_count,
+            "tp_rate": tp_rate,
+            "sl_count": sl_count,
+            "sl_rate": sl_rate,
+            "other_count": other_count,
+            "other_rate": other_rate,
+        }
+
+    @staticmethod
+    def _format_costom6_output(
+        data_label: str,
+        stats: Dict[str, Any],
+    ) -> str:
+        total = int(stats.get("total", 0) or 0)
+        wins = int(stats.get("wins", 0) or 0)
+        win_rate = float(stats.get("win_rate", 0.0) or 0.0)
+        tp_count = int(stats.get("tp_count", 0) or 0)
+        tp_rate = float(stats.get("tp_rate", 0.0) or 0.0)
+        sl_count = int(stats.get("sl_count", 0) or 0)
+        sl_rate = float(stats.get("sl_rate", 0.0) or 0.0)
+        other_count = int(stats.get("other_count", 0) or 0)
+        other_rate = float(stats.get("other_rate", 0.0) or 0.0)
+        lines = [
+            "**📈 Costom6 auto-leverage min-loss stats**",
+            f"🗂️  Data: `{data_label}`",
+            f"🎯 Trades (auto min-loss applied): {total}",
+        ]
+        if total <= 0:
+            lines.append("No exit trades matched auto leverage min-loss applied.")
+            return "\n".join(lines)
+        lines.extend(
+            [
+                f"✅ Win rate: {wins}/{total} ({win_rate:.1f}%)",
+                f"🎯 TP reach rate: {tp_count}/{total} ({tp_rate:.1f}%)",
+                f"🛑 SL reach rate: {sl_count}/{total} ({sl_rate:.1f}%)",
+                f"🔎 Other exit rate: {other_count}/{total} ({other_rate:.1f}%)",
+            ]
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _format_costom4_output(
@@ -9069,6 +10244,31 @@ class BacktestBot(commands.Bot):
             tp_output_path,
             title=f"Entry minute TP reach rate ({data_pattern})",
         )
+        entry_elapsed_charts: list[Path] = []
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            for group, prefix in (
+                ("TP", "costom4_entry_elapsed_tp_"),
+                ("SL", "costom4_entry_elapsed_sl_"),
+                ("Other", "costom4_entry_elapsed_other_"),
+            ):
+                with tempfile.NamedTemporaryFile(
+                    prefix=prefix,
+                    suffix=".png",
+                    delete=False,
+                ) as tmp_file:
+                    elapsed_output_path = Path(tmp_file.name)
+                chart = await asyncio.to_thread(
+                    create_entry_elapsed_return_distribution_group_chart,
+                    result,
+                    data,
+                    elapsed_output_path,
+                    group,
+                    10,
+                    1000,
+                    f"Return distribution by minutes after entry ({group}) ({data_pattern})",
+                )
+                if chart:
+                    entry_elapsed_charts.append(chart)
         with tempfile.NamedTemporaryFile(
             prefix="costom4_tp_target_win_",
             suffix=".png",
@@ -9170,6 +10370,8 @@ class BacktestBot(commands.Bot):
             chart_paths.append(entry_minute_chart)
         if entry_minute_tp_chart:
             chart_paths.append(entry_minute_tp_chart)
+        if entry_elapsed_charts:
+            chart_paths.extend(entry_elapsed_charts)
         if tp_target_chart:
             chart_paths.append(tp_target_chart)
         if sl_target_chart:
@@ -9198,6 +10400,337 @@ class BacktestBot(commands.Bot):
         else:
             await interaction.followup.send(
                 "Costom4 complete. Results posted here.",
+                ephemeral=True,
+            )
+
+    async def _run_costom6_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        tokens: List[str],
+        data_file: Optional[str],
+    ) -> None:
+        if tokens:
+            await interaction.response.send_message(
+                "Usage: `!costom6 [--data FILE]`",
+                ephemeral=True,
+            )
+            return
+
+        base_settings = load_settings(self.settings_path)
+        if data_file:
+            if not any(ch in data_file for ch in "*?[]"):
+                if data_file not in self._list_price_files():
+                    await interaction.response.send_message(
+                        f"Data file not found: {data_file} (use `!data list`)",
+                        ephemeral=True,
+                    )
+                    return
+            base_settings.data["file_pattern"] = data_file
+
+        await interaction.response.defer(thinking=True)
+        loop = asyncio.get_running_loop()
+        settings_copy = copy.deepcopy(base_settings)
+        chart_cfg = settings_copy.backtest.get("chart")
+        if isinstance(chart_cfg, dict):
+            chart_cfg = dict(chart_cfg)
+            chart_cfg["enabled"] = False
+        else:
+            chart_cfg = {"enabled": False}
+        settings_copy.backtest["chart"] = chart_cfg
+
+        try:
+            _, _, _, result, data = await loop.run_in_executor(
+                None,
+                run_backtest_with_result,
+                settings_copy,
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Costom6 failed: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        self._last_backtest = {"result": result, "data": data}
+        data_pattern = settings_copy.data.get("file_pattern", "*.csv")
+        stats = BacktestBot._compute_costom6_stats(result)
+        message = BacktestBot._format_costom6_output(
+            data_label=str(data_pattern),
+            stats=stats,
+        )
+
+        chart_paths: list[Path] = []
+        trades = stats.get("trades") or []
+        if trades:
+            with tempfile.NamedTemporaryFile(
+                prefix="costom6_returns_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                returns_output_path = Path(tmp_file.name)
+            returns_chart = await asyncio.to_thread(
+                create_costom6_trade_return_extremes_chart,
+                trades,
+                returns_output_path,
+                300,
+                f"Min/Max/Final return (sorted by final) ({data_pattern})",
+            )
+            if returns_chart:
+                chart_paths.append(returns_chart)
+
+            with tempfile.NamedTemporaryFile(
+                prefix="costom6_hold_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                hold_output_path = Path(tmp_file.name)
+            hold_chart = await asyncio.to_thread(
+                create_costom6_holding_time_chart,
+                trades,
+                hold_output_path,
+                300,
+                f"Holding time (sorted by final) ({data_pattern})",
+            )
+            if hold_chart:
+                chart_paths.append(hold_chart)
+
+        result_channel = await self._get_result_channel()
+        target_channel = result_channel or interaction.channel
+        if target_channel is None:
+            await interaction.followup.send(
+                "Costom6 complete, but I couldn't find a channel to post results.",
+                ephemeral=True,
+            )
+            return
+
+        await self._send_message_and_charts(
+            target_channel.send,
+            message,
+            chart_paths,
+        )
+
+        if result_channel is not None:
+            await interaction.followup.send(
+                f"Costom6 complete. Results posted in #{result_channel.name}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "Costom6 complete. Results posted here.",
+                ephemeral=True,
+            )
+
+    async def _run_costom5_from_interaction(
+        self,
+        interaction: discord.Interaction,
+        tokens: List[str],
+        data_file: Optional[str],
+    ) -> None:
+        if len(tokens) != 4:
+            await interaction.response.send_message(
+                "Usage: `!costom5 [--data FILE] section.key start end step`\n"
+                "Example: `!costom5 --data BTC.csv strategy.params.fast_window 5 20 1`",
+                ephemeral=True,
+            )
+            return
+        base_settings = load_settings(self.settings_path)
+        if data_file:
+            if not any(ch in data_file for ch in "*?[]"):
+                if data_file not in self._list_price_files():
+                    await interaction.response.send_message(
+                        f"Data file not found: {data_file} (use `!data list`)",
+                        ephemeral=True,
+                    )
+                    return
+            base_settings.data["file_pattern"] = data_file
+
+        var1, err = self._parse_grid_var(base_settings, tokens[0])
+        if err:
+            await interaction.response.send_message(
+                f"Invalid variable: {err}",
+                ephemeral=True,
+            )
+            return
+        values1, err = self._build_grid_values(tokens[1], tokens[2], tokens[3])
+        if err:
+            await interaction.response.send_message(
+                f"Invalid range: {err}",
+                ephemeral=True,
+            )
+            return
+
+        max_runs = 50
+        total_runs = len(values1)
+        if total_runs > max_runs:
+            await interaction.response.send_message(
+                f"Too many combinations ({total_runs}). Please keep it under {max_runs}.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        progress_msg = await interaction.followup.send(
+            f"Running costom5 backtests (0/{total_runs})...",
+            wait=True,
+        )
+        progress_channel = progress_msg.channel or interaction.channel
+        channel_id = (
+            int(progress_channel.id)
+            if progress_channel is not None
+            else int(interaction.channel.id)
+        )
+        progress_handle = self._register_grid_progress(
+            progress_msg,
+            channel_id,
+            total_runs,
+        )
+        loop = asyncio.get_running_loop()
+        progress_state = {"last_done": 0, "last_ts": 0.0}
+
+        async def update_progress(done: int, total: int) -> None:
+            progress_handle.done = done
+            progress_handle.total = total
+            pct = int((done / total) * 100) if total else 100
+            message = progress_handle.message
+            if message is not None:
+                try:
+                    await message.edit(
+                        content=f"Running costom5 backtests ({done}/{total})... {pct}%"
+                    )
+                    return
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden) as exc:
+                    logger.warning(
+                        "Costom5 progress update failed; posting new message: %s", exc
+                    )
+            channel = progress_channel or self.get_channel(progress_handle.channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(progress_handle.channel_id)
+                except Exception as exc:
+                    logger.warning("Costom5 progress send failed: %s", exc)
+                    return
+            try:
+                progress_handle.message = await channel.send(
+                    f"Running costom5 backtests ({done}/{total})... {pct}%"
+                )
+            except discord.HTTPException as exc:
+                logger.warning("Costom5 progress send failed: %s", exc)
+                return
+
+        def progress_cb(done: int, total: int) -> None:
+            now = time.monotonic()
+            step = max(1, total // 20) if total else 1
+            if done < total:
+                if done - progress_state["last_done"] < step and (now - progress_state["last_ts"]) < 2.0:
+                    return
+            progress_state["last_done"] = done
+            progress_state["last_ts"] = now
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(update_progress(done, total))
+            )
+
+        try:
+            results = await loop.run_in_executor(
+                None,
+                self._run_costom5_backtests,
+                base_settings,
+                var1,
+                values1,
+                progress_cb,
+                total_runs,
+            )
+        finally:
+            self._unregister_grid_progress(progress_handle)
+
+        data_pattern = base_settings.data.get("file_pattern", "*.csv")
+        result_channel = await self._get_result_channel()
+        target_channel = result_channel or interaction.channel or progress_channel
+        if target_channel is None:
+            await interaction.followup.send(
+                "Costom5 complete, but I couldn't find a channel to post results.",
+                ephemeral=True,
+            )
+            return
+
+        for entry in results:
+            value = entry.get("value")
+            error = entry.get("error")
+            if error:
+                message = f"Costom5 failed for `{var1['label']}={value}`: {error}"
+                await target_channel.send(content=message)
+                continue
+            result = entry.get("result")
+            if result is None:
+                message = f"Costom5 failed for `{var1['label']}={value}`: missing result"
+                await target_channel.send(content=message)
+                continue
+
+            _, tp_target_stats = await asyncio.to_thread(
+                compute_tp_target_win_rate,
+                result,
+                5.0,
+            )
+            _, sl_target_stats = await asyncio.to_thread(
+                compute_sl_target_win_rate,
+                result,
+                5.0,
+            )
+            message = BacktestBot._format_costom5_output(
+                var1,
+                value,
+                tp_target_stats,
+                sl_target_stats,
+                data_label=str(data_pattern),
+            )
+
+            chart_paths: list[Path] = []
+            with tempfile.NamedTemporaryFile(
+                prefix="costom5_tp_target_win_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                tp_target_output_path = Path(tmp_file.name)
+            tp_target_chart = await asyncio.to_thread(
+                create_tp_target_win_rate_chart,
+                result,
+                tp_target_output_path,
+                5.0,
+                f"Win rate by target TP (bin=5) ({data_pattern})",
+            )
+            if tp_target_chart:
+                chart_paths.append(tp_target_chart)
+            with tempfile.NamedTemporaryFile(
+                prefix="costom5_sl_target_win_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                sl_target_output_path = Path(tmp_file.name)
+            sl_target_chart = await asyncio.to_thread(
+                create_sl_target_win_rate_chart,
+                result,
+                sl_target_output_path,
+                5.0,
+                f"Win rate by target SL (bin=5) ({data_pattern})",
+            )
+            if sl_target_chart:
+                chart_paths.append(sl_target_chart)
+
+            if not chart_paths:
+                chart_paths = None
+            await self._send_message_and_charts(
+                target_channel.send,
+                message,
+                chart_paths,
+            )
+
+        if result_channel is not None:
+            await interaction.followup.send(
+                f"Costom5 complete. Results posted in #{result_channel.name}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "Costom5 complete. Results posted here.",
                 ephemeral=True,
             )
 
@@ -11392,6 +12925,31 @@ class BacktestBot(commands.Bot):
             tp_output_path,
             title=f"Entry minute TP reach rate ({data_pattern})",
         )
+        entry_elapsed_charts: list[Path] = []
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            for group, prefix in (
+                ("TP", "costom4_entry_elapsed_tp_"),
+                ("SL", "costom4_entry_elapsed_sl_"),
+                ("Other", "costom4_entry_elapsed_other_"),
+            ):
+                with tempfile.NamedTemporaryFile(
+                    prefix=prefix,
+                    suffix=".png",
+                    delete=False,
+                ) as tmp_file:
+                    elapsed_output_path = Path(tmp_file.name)
+                chart = await asyncio.to_thread(
+                    create_entry_elapsed_return_distribution_group_chart,
+                    result,
+                    data,
+                    elapsed_output_path,
+                    group,
+                    10,
+                    1000,
+                    f"Return distribution by minutes after entry ({group}) ({data_pattern})",
+                )
+                if chart:
+                    entry_elapsed_charts.append(chart)
         with tempfile.NamedTemporaryFile(
             prefix="costom4_tp_target_win_",
             suffix=".png",
@@ -11476,6 +13034,8 @@ class BacktestBot(commands.Bot):
             chart_paths.append(entry_minute_chart)
         if entry_minute_tp_chart:
             chart_paths.append(entry_minute_tp_chart)
+        if entry_elapsed_charts:
+            chart_paths.extend(entry_elapsed_charts)
         if tp_target_chart:
             chart_paths.append(tp_target_chart)
         if sl_target_chart:
@@ -11500,6 +13060,415 @@ class BacktestBot(commands.Bot):
             )
         else:
             await ctx.reply("Costom4 complete. Results posted here.")
+
+    async def costom5_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can run backtests.")
+            return
+        if not self._is_backtest_channel(ctx.channel):
+            await ctx.reply(self._backtest_channel_notice())
+            return
+
+        tokens = shlex.split(args) if args else []
+        data_file: Optional[str] = None
+        if tokens:
+            filtered: List[str] = []
+            idx = 0
+            while idx < len(tokens):
+                token = tokens[idx]
+                if token == "--data":
+                    if idx + 1 >= len(tokens):
+                        await ctx.reply("Missing value after `--data`.")
+                        return
+                    data_file = tokens[idx + 1]
+                    idx += 2
+                    continue
+                if token.startswith("--data="):
+                    data_file = token.split("=", 1)[1]
+                    idx += 1
+                    continue
+                if token.startswith("data=") or token.startswith("data_file=") or token.startswith("file="):
+                    data_file = token.split("=", 1)[1]
+                    idx += 1
+                    continue
+                filtered.append(token)
+                idx += 1
+            tokens = filtered
+
+        if not tokens:
+            view = Costom5SetupView(self, ctx.author.id)
+            message = await ctx.reply(view._summary(), view=view)
+            view.message = message
+            return
+
+        if len(tokens) != 4:
+            await ctx.reply(
+                "Usage: `!costom5 [--data FILE] section.key start end step`\n"
+                "Example: `!costom5 --data BTC.csv strategy.params.fast_window 5 20 1`"
+            )
+            return
+        if data_file is None:
+            files = self._list_price_files()
+            if files:
+                if len(files) > 25:
+                    notice = (
+                        "Select a data file for costom5 "
+                        "(showing latest 25 files, or Default to use settings):"
+                    )
+                    files = files[-25:]
+                else:
+                    notice = "Select a data file for costom5 (or Default to use settings):"
+                view = Costom5DataFileView(self, files, tokens, ctx.author.id)
+                await ctx.reply(notice, view=view)
+                return
+
+        base_settings = load_settings(self.settings_path)
+        err = self._apply_forced_strategy(base_settings, ctx.channel)
+        if err:
+            await ctx.reply(err)
+            return
+        if data_file:
+            if not any(ch in data_file for ch in "*?[]"):
+                if data_file not in self._list_price_files():
+                    await ctx.reply(
+                        f"Data file not found: {data_file} (use `!data list`)"
+                    )
+                    return
+            base_settings.data["file_pattern"] = data_file
+
+        var1, err = self._parse_grid_var(base_settings, tokens[0])
+        if err:
+            await ctx.reply(f"Invalid variable: {err}")
+            return
+        values1, err = self._build_grid_values(tokens[1], tokens[2], tokens[3])
+        if err:
+            await ctx.reply(f"Invalid range: {err}")
+            return
+
+        max_runs = 50
+        total_runs = len(values1)
+        if total_runs > max_runs:
+            await ctx.reply(
+                f"Too many combinations ({total_runs}). "
+                f"Please keep it under {max_runs}."
+            )
+            return
+
+        progress_msg = await ctx.reply(
+            f"Running costom5 backtests (0/{total_runs})..."
+        )
+        progress_channel = progress_msg.channel or ctx.channel
+        channel_id = (
+            int(progress_channel.id)
+            if progress_channel is not None
+            else int(ctx.channel.id)
+        )
+        progress_handle = self._register_grid_progress(
+            progress_msg,
+            channel_id,
+            total_runs,
+        )
+        loop = asyncio.get_running_loop()
+        progress_state = {"last_done": 0, "last_ts": 0.0}
+
+        async def update_progress(done: int, total: int) -> None:
+            progress_handle.done = done
+            progress_handle.total = total
+            pct = int((done / total) * 100) if total else 100
+            message = progress_handle.message
+            if message is not None:
+                try:
+                    await message.edit(
+                        content=f"Running costom5 backtests ({done}/{total})... {pct}%"
+                    )
+                    return
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden) as exc:
+                    logger.warning(
+                        "Costom5 progress update failed; posting new message: %s", exc
+                    )
+            channel = progress_channel or self.get_channel(progress_handle.channel_id)
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(progress_handle.channel_id)
+                except Exception as exc:
+                    logger.warning("Costom5 progress send failed: %s", exc)
+                    return
+            try:
+                progress_handle.message = await channel.send(
+                    f"Running costom5 backtests ({done}/{total})... {pct}%"
+                )
+            except discord.HTTPException as exc:
+                logger.warning("Costom5 progress send failed: %s", exc)
+                return
+
+        def progress_cb(done: int, total: int) -> None:
+            now = time.monotonic()
+            step = max(1, total // 20) if total else 1
+            if done < total:
+                if done - progress_state["last_done"] < step and (now - progress_state["last_ts"]) < 2.0:
+                    return
+            progress_state["last_done"] = done
+            progress_state["last_ts"] = now
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(update_progress(done, total))
+            )
+
+        try:
+            results = await loop.run_in_executor(
+                None,
+                self._run_costom5_backtests,
+                base_settings,
+                var1,
+                values1,
+                progress_cb,
+                total_runs,
+            )
+        finally:
+            self._unregister_grid_progress(progress_handle)
+
+        data_pattern = base_settings.data.get("file_pattern", "*.csv")
+        result_channel = await self._get_result_channel()
+        target_channel = result_channel or ctx.channel or progress_channel
+        if target_channel is None:
+            await ctx.reply(
+                "Costom5 complete, but I couldn't find a channel to post results."
+            )
+            return
+
+        for entry in results:
+            value = entry.get("value")
+            error = entry.get("error")
+            if error:
+                message = f"Costom5 failed for `{var1['label']}={value}`: {error}"
+                await target_channel.send(content=message)
+                continue
+            result = entry.get("result")
+            if result is None:
+                message = f"Costom5 failed for `{var1['label']}={value}`: missing result"
+                await target_channel.send(content=message)
+                continue
+
+            _, tp_target_stats = await asyncio.to_thread(
+                compute_tp_target_win_rate,
+                result,
+                5.0,
+            )
+            _, sl_target_stats = await asyncio.to_thread(
+                compute_sl_target_win_rate,
+                result,
+                5.0,
+            )
+            message = BacktestBot._format_costom5_output(
+                var1,
+                value,
+                tp_target_stats,
+                sl_target_stats,
+                data_label=str(data_pattern),
+            )
+
+            chart_paths: list[Path] = []
+            with tempfile.NamedTemporaryFile(
+                prefix="costom5_tp_target_win_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                tp_target_output_path = Path(tmp_file.name)
+            tp_target_chart = await asyncio.to_thread(
+                create_tp_target_win_rate_chart,
+                result,
+                tp_target_output_path,
+                5.0,
+                f"Win rate by target TP (bin=5) ({data_pattern})",
+            )
+            if tp_target_chart:
+                chart_paths.append(tp_target_chart)
+            with tempfile.NamedTemporaryFile(
+                prefix="costom5_sl_target_win_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                sl_target_output_path = Path(tmp_file.name)
+            sl_target_chart = await asyncio.to_thread(
+                create_sl_target_win_rate_chart,
+                result,
+                sl_target_output_path,
+                5.0,
+                f"Win rate by target SL (bin=5) ({data_pattern})",
+            )
+            if sl_target_chart:
+                chart_paths.append(sl_target_chart)
+
+            if not chart_paths:
+                chart_paths = None
+            await self._send_message_and_charts(
+                target_channel.send,
+                message,
+                chart_paths,
+            )
+
+        if result_channel is not None:
+            await ctx.reply(
+                f"Costom5 complete. Results posted in #{result_channel.name}."
+            )
+        else:
+            await ctx.reply("Costom5 complete. Results posted here.")
+
+    async def costom6_text(self, ctx: commands.Context, *, args: str = "") -> None:
+        if ctx.guild is None:
+            await ctx.reply("This command can only be used in a server channel.")
+            return
+        if not self._is_guild_owner_ctx(ctx):
+            await ctx.reply("Only the server owner can run backtests.")
+            return
+        if not self._is_backtest_channel(ctx.channel):
+            await ctx.reply(self._backtest_channel_notice())
+            return
+
+        tokens = shlex.split(args) if args else []
+        data_file: Optional[str] = None
+        if tokens:
+            filtered: List[str] = []
+            idx = 0
+            while idx < len(tokens):
+                token = tokens[idx]
+                if token == "--data":
+                    if idx + 1 >= len(tokens):
+                        await ctx.reply("Missing value after `--data`.")
+                        return
+                    data_file = tokens[idx + 1]
+                    idx += 2
+                    continue
+                if token.startswith("--data="):
+                    data_file = token.split("=", 1)[1]
+                    idx += 1
+                    continue
+                if token.startswith("data=") or token.startswith("data_file=") or token.startswith("file="):
+                    data_file = token.split("=", 1)[1]
+                    idx += 1
+                    continue
+                filtered.append(token)
+                idx += 1
+            tokens = filtered
+
+        if tokens:
+            await ctx.reply("Usage: `!costom6 [--data FILE]`")
+            return
+
+        if data_file is None:
+            files = self._list_price_files()
+            if files:
+                # Select options max is 25; we include a default option.
+                if len(files) > 24:
+                    notice = (
+                        "Select a data file for costom6 "
+                        "(showing latest 24 files, or Default to use settings):"
+                    )
+                    files = files[-24:]
+                else:
+                    notice = "Select a data file for costom6 (or Default to use settings):"
+                view = Costom6DataFileView(self, files, tokens, ctx.author.id)
+                await ctx.reply(notice, view=view)
+                return
+
+        base_settings = load_settings(self.settings_path)
+        err = self._apply_forced_strategy(base_settings, ctx.channel)
+        if err:
+            await ctx.reply(err)
+            return
+        if data_file:
+            if not any(ch in data_file for ch in "*?[]"):
+                if data_file not in self._list_price_files():
+                    await ctx.reply(
+                        f"Data file not found: {data_file} (use `!data list`)"
+                    )
+                    return
+            base_settings.data["file_pattern"] = data_file
+
+        await ctx.reply("Running costom6...")
+        loop = asyncio.get_running_loop()
+        settings_copy = copy.deepcopy(base_settings)
+        chart_cfg = settings_copy.backtest.get("chart")
+        if isinstance(chart_cfg, dict):
+            chart_cfg = dict(chart_cfg)
+            chart_cfg["enabled"] = False
+        else:
+            chart_cfg = {"enabled": False}
+        settings_copy.backtest["chart"] = chart_cfg
+
+        try:
+            _, _, _, result, data = await loop.run_in_executor(
+                None,
+                run_backtest_with_result,
+                settings_copy,
+            )
+        except Exception as exc:
+            await ctx.reply(f"Costom6 failed: {exc}")
+            return
+
+        self._last_backtest = {"result": result, "data": data}
+        data_pattern = settings_copy.data.get("file_pattern", "*.csv")
+        stats = BacktestBot._compute_costom6_stats(result)
+        message = BacktestBot._format_costom6_output(
+            data_label=str(data_pattern),
+            stats=stats,
+        )
+
+        chart_paths: list[Path] = []
+        trades = stats.get("trades") or []
+        if trades:
+            with tempfile.NamedTemporaryFile(
+                prefix="costom6_returns_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                returns_output_path = Path(tmp_file.name)
+            returns_chart = await asyncio.to_thread(
+                create_costom6_trade_return_extremes_chart,
+                trades,
+                returns_output_path,
+                300,
+                f"Min/Max/Final return (sorted by final) ({data_pattern})",
+            )
+            if returns_chart:
+                chart_paths.append(returns_chart)
+
+            with tempfile.NamedTemporaryFile(
+                prefix="costom6_hold_",
+                suffix=".png",
+                delete=False,
+            ) as tmp_file:
+                hold_output_path = Path(tmp_file.name)
+            hold_chart = await asyncio.to_thread(
+                create_costom6_holding_time_chart,
+                trades,
+                hold_output_path,
+                300,
+                f"Holding time (sorted by final) ({data_pattern})",
+            )
+            if hold_chart:
+                chart_paths.append(hold_chart)
+
+        result_channel = await self._get_result_channel()
+        target_channel = result_channel or ctx.channel
+        if target_channel is None:
+            await ctx.reply(
+                "Costom6 complete, but I couldn't find a channel to post results."
+            )
+            return
+        await self._send_message_and_charts(
+            target_channel.send,
+            message,
+            chart_paths,
+        )
+        if result_channel is not None:
+            await ctx.reply(
+                f"Costom6 complete. Results posted in #{result_channel.name}."
+            )
+        else:
+            await ctx.reply("Costom6 complete. Results posted here.")
 
     async def costom3_text(self, ctx: commands.Context, *, args: str = "") -> None:
         if ctx.guild is None:
@@ -11825,6 +13794,7 @@ class BacktestBot(commands.Bot):
             )
             return
 
+        self._ensure_strategy_param_defaults()
         entries = self._flatten_settings()
         if not entries:
             await ctx.reply("No editable settings found.")
@@ -11845,6 +13815,12 @@ class BacktestBot(commands.Bot):
         if group == "backtest":
             await ctx.reply("Backtest status/log channels are disabled.")
             return
+        runner = self._runner_for_group(group)
+        if runner is not None and runner.is_running():
+            try:
+                await runner.refresh_payload()
+            except Exception as exc:
+                logger.warning("Status refresh failed for %s runner: %s", group, exc)
         snapshot = self._status_snapshot_for_group(group)
         if snapshot is None:
             await ctx.reply("No status snapshot available yet.")
@@ -12138,7 +14114,6 @@ class BacktestBot(commands.Bot):
         default_leverage = self._parse_float(
             cfg.get("leverage", self.settings.backtest.get("leverage", 1.0)), 1.0
         )
-        sizing_buffer = 0.99
         position_size = self._parse_float(cfg.get("position_size", 1.0), 1.0)
         if position_size <= 0:
             position_size = 1.0
@@ -12182,11 +14157,12 @@ class BacktestBot(commands.Bot):
 
         if not args.strip():
             usage = (
-                "Usage: `!livetest buy|sell|close [args]`\n"
+                "Usage: `!livetest buy|sell|close|settpsl [args]`\n"
                 "Entry: `!livetest buy|sell [equity_override] [price] [leverage]`\n"
                 "Close: `!livetest close [long|short] [price]`\n"
+                "TP/SL: `!livetest settpsl [long|short]`\n"
                 f"Defaults: symbol={default_symbol}, leverage={default_leverage}\n"
-                "Sizing: equity * position_size * leverage / price * 0.99 / parts (same as live entry)\n"
+                "Sizing: equity * position_size * leverage / price / parts (same as live planned sizing)\n"
                 "If leverage is omitted, strategy long/short leverage override is used when configured.\n"
                 "Examples:\n"
                 f"- `!livetest buy` (uses {default_symbol} current price & available balance)\n"
@@ -12220,6 +14196,25 @@ class BacktestBot(commands.Bot):
 
         tokens = shlex.split(args)
         action = tokens[0].lower() if tokens else ""
+        if action in {"settpsl", "tpsl", "targets"}:
+            side: Optional[str] = None
+            if len(tokens) > 1:
+                side_token = tokens[1].lower()
+                if side_token in {"long", "buy"}:
+                    side = "long"
+                elif side_token in {"short", "sell"}:
+                    side = "short"
+                else:
+                    await ctx.reply("Usage: `!livetest settpsl [long|short]`")
+                    return
+            view = LiveTestTargetStartView(self, ctx.author.id, side)
+            message = (
+                "TP/SL 입력창을 열려면 아래 버튼을 눌러주세요.\n"
+                "수익률은 레버리지 반영 % 기준입니다. (예: 레버리지 10x, TP 10 → 10% 수익 구간)"
+            )
+            msg = await ctx.reply(message, view=view)
+            view.message = msg
+            return
         if action in {"close", "exit"}:
             close_args = " ".join(tokens[1:]) if len(tokens) > 1 else ""
             await self.closetest_text(ctx, args=close_args)
@@ -12254,30 +14249,6 @@ class BacktestBot(commands.Bot):
             await ctx.reply(err)
             return
 
-        available, wallet, current_price, note = await self._fetch_live_account_snapshot(
-            client, runner.symbol
-        )
-        if price <= 0 and current_price:
-            price = float(current_price)
-        if price <= 0:
-            extra = f" ({note})" if note else ""
-            await ctx.reply(f"Price unavailable for {runner.symbol}.{extra}")
-            return
-
-        equity = available if available is not None else wallet
-        if usdt_amount <= 0:
-            if equity is None:
-                await ctx.reply(
-                    "Balance unavailable. Provide `equity_override` explicitly, e.g. "
-                    "`!livetest buy 20`."
-                )
-                return
-            usdt_amount = equity
-
-        if usdt_amount <= 0:
-            await ctx.reply("Invalid equity amount.")
-            return
-
         leverage_override = None
         if strategy is not None:
             leverage_override = (
@@ -12304,44 +14275,38 @@ class BacktestBot(commands.Bot):
         else:
             leverage_source = "config"
 
-        base_qty = (
-            (usdt_amount * position_size * leverage) / price * sizing_buffer
-            if price > 0
-            else 0.0
+        equity_override = usdt_amount if usdt_amount > 0 else None
+        trade, err = await runner.build_livetest_signal_entry_trade(
+            direction,
+            price=price,
+            equity_override=equity_override,
+            leverage_override=leverage,
         )
-        qty = base_qty / entry_parts if entry_parts > 0 else base_qty
-        if qty <= 0:
-            await ctx.reply("Calculated quantity is too small.")
+        if err:
+            await ctx.reply(err)
             return
-
-        now = datetime.now(timezone.utc)
-        trade = {
-            "type": "entry",
-            "direction": direction,
-            "qty": qty,
-            "price": price,
-            "entry_price": price,
-            "leverage": leverage,
-            "timestamp": now,
-            "entry_time": now,
-            "entry_reason": "manual_test",
-        }
         result = await runner._submit_live_order(trade)
         await self._handle_realtime_order("live", trade, result)
         if result.success:
+            runner._update_entry_cache_from_trade(trade)
+            if result.order_id is not None:
+                runner._update_entry_cache_from_order(trade, result.order_id)
             data = runner.get_chart_data(include_live=True)
             await self._handle_realtime_trade("live", trade, data)
 
         status = (result.status or "error").upper()
         detail = f" | {result.detail}" if result.detail else ""
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        price = float(trade.get("price", 0.0) or 0.0)
         notional = abs(price * qty)
         margin_usdt = self._calc_margin_usdt(price, qty, leverage)
-        equity_note = f"{usdt_amount:,.2f}"
+        equity_note = f"{equity_override:,.2f}" if equity_override is not None else "auto"
+        parts_note = runner._planned_entry_parts if runner._planned_entry_parts > 0 else 1
         await ctx.reply(
             f"Live test {side_label} 주문 결과: {status}{detail} "
             f"(qty {qty:.6g} @ {self._fmt_price(price)}, lev {leverage:.2f}x, "
             f"equity {equity_note} USDT, position_size {position_size:.2f}, "
-            f"parts {entry_parts}, buffer {sizing_buffer:.2f}, "
+            f"parts {parts_note}, "
             f"leverage_source {leverage_source}, "
             f"레버리지 적용 금액 {notional:,.2f} USDT, "
             f"투입 원금 {margin_usdt:,.2f} USDT)"
@@ -12385,102 +14350,10 @@ class BacktestBot(commands.Bot):
         if runner is None:
             await ctx.reply("Live runner could not be initialized. Check API settings.")
             return
-
-        client, err = self._get_live_client()
+        trade, err = await runner.build_livetest_signal_exit_trade(direction, price)
         if err:
             await ctx.reply(err)
             return
-
-        try:
-            positions = await asyncio.to_thread(
-                client.get_position_risk, runner.symbol
-            )
-        except Exception as exc:
-            await ctx.reply(f"Failed to fetch positions: {exc}")
-            return
-        if not isinstance(positions, list):
-            await ctx.reply("No position data returned.")
-            return
-
-        long_item = None
-        short_item = None
-        for item in positions:
-            if not isinstance(item, dict):
-                continue
-            symbol = str(item.get("symbol", "") or "").upper()
-            if symbol != runner.symbol:
-                continue
-            try:
-                position_amt = float(item.get("positionAmt", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                position_amt = 0.0
-            if position_amt > 0:
-                long_item = item
-            elif position_amt < 0:
-                short_item = item
-
-        if direction is None:
-            if long_item is not None and short_item is None:
-                direction = 1
-            elif short_item is not None and long_item is None:
-                direction = -1
-            else:
-                await ctx.reply(
-                    "Usage: `!closetest [long|short] [price]` (multiple positions found)"
-                )
-                return
-
-        selected = long_item if direction > 0 else short_item
-        if selected is None:
-            await ctx.reply("No matching open position to close.")
-            return
-
-        try:
-            qty = abs(float(selected.get("positionAmt", 0.0) or 0.0))
-        except (TypeError, ValueError):
-            qty = 0.0
-        if qty <= 0:
-            await ctx.reply("Position quantity unavailable.")
-            return
-
-        if price <= 0:
-            payload = self._realtime_payloads.get("live")
-            if payload and payload.symbol == runner.symbol and payload.price:
-                price = float(payload.price)
-            else:
-                try:
-                    price = float(await asyncio.to_thread(client.get_price, runner.symbol))
-                except Exception:
-                    price = 0.0
-        if price <= 0:
-            await ctx.reply(f"Price unavailable for {runner.symbol}.")
-            return
-
-        entry_price = self._parse_float(selected.get("entryPrice"), 0.0)
-        leverage = self._parse_float(selected.get("leverage"), 1.0)
-        if leverage <= 0:
-            leverage = 1.0
-
-        now = datetime.now(timezone.utc)
-        trade = {
-            "type": "exit",
-            "direction": direction,
-            "qty": qty,
-            "price": price,
-            "entry_price": entry_price if entry_price > 0 else price,
-            "leverage": leverage,
-            "timestamp": now,
-            "exit_time": now,
-            "exit_reason": "manual_test",
-        }
-        if entry_price > 0:
-            notional = entry_price * qty
-            pnl = (price - entry_price) * qty * direction
-            ret = pnl / notional if notional > 0 else 0.0
-            trade["pnl"] = pnl
-            trade["return"] = ret
-            trade["min_return"] = ret
-            trade["max_return"] = ret
 
         result = await runner._submit_live_order(trade)
         await self._handle_realtime_order("live", trade, result)
@@ -12490,6 +14363,12 @@ class BacktestBot(commands.Bot):
 
         status = (result.status or "error").upper()
         detail = f" | {result.detail}" if result.detail else ""
+        direction = int(trade.get("direction", 0) or 0)
+        qty = float(trade.get("qty", 0.0) or 0.0)
+        price = float(trade.get("price", 0.0) or 0.0)
+        leverage = float(trade.get("leverage", 1.0) or 1.0)
+        if leverage <= 0:
+            leverage = 1.0
         margin_usdt = self._calc_margin_usdt(price, qty, leverage)
         side_label = "롱" if direction > 0 else "숏"
         await ctx.reply(
@@ -12567,9 +14446,6 @@ class BacktestBot(commands.Bot):
             return
         if not self._is_live_channel(ctx.channel):
             await ctx.reply("`!close` is only available in live channels.")
-            return
-        if not self._is_guild_owner_ctx(ctx):
-            await ctx.reply("Only the server owner can close positions.")
             return
         if args.strip():
             await ctx.reply("Usage: `!close`")
@@ -13078,12 +14954,12 @@ class BacktestBot(commands.Bot):
                     return
         else:
             tokens = shlex.split(args or "")
-            if not tokens:
-                await _send(
-                    "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
-                    ephemeral=True,
-                )
-                return
+        if not tokens:
+            await _send(
+                "Usage: `!order long|short usdt_amount [price] [symbol] [leverage]`",
+                ephemeral=True,
+            )
+            return
 
             if len(tokens) < 2:
                 await _send(
@@ -13126,6 +15002,7 @@ class BacktestBot(commands.Bot):
                 text = token.strip()
                 if not text:
                     continue
+
                 lower = text.lower()
                 if lower.endswith("x") and leverage is None:
                     parsed = _extract_float(lower[:-1])
@@ -13329,6 +15206,189 @@ class BacktestBot(commands.Bot):
         )
         await _send_with_view(confirm_text, view, ephemeral=isinstance(target, discord.Interaction))
 
+    async def _handle_livetest_settpsl(
+        self,
+        target: Union[discord.Interaction, commands.Context],
+        side: Optional[str],
+        *,
+        modal_fields: Optional[Dict[str, str]] = None,
+    ) -> None:
+        async def _send(message: str, *, ephemeral: bool = False) -> None:
+            if isinstance(target, discord.Interaction):
+                channel = getattr(target, "channel", None)
+                if self._interaction_is_expired(target):
+                    if channel is not None:
+                        await channel.send(message)
+                    return
+                try:
+                    if target.response.is_done():
+                        await target.followup.send(message, ephemeral=ephemeral)
+                    else:
+                        await target.response.send_message(message, ephemeral=ephemeral)
+                    return
+                except (discord.NotFound, discord.errors.NotFound, discord.HTTPException) as exc:
+                    if getattr(exc, "code", None) not in {None, 10062}:
+                        raise
+                    try:
+                        await target.followup.send(message, ephemeral=ephemeral)
+                        return
+                    except Exception:
+                        if channel is not None:
+                            await channel.send(message)
+            else:
+                await target.reply(message)
+
+        if modal_fields is None:
+            await _send("TP/SL 입력값이 없습니다. 다시 시도해주세요.", ephemeral=True)
+            return
+
+        tp_text = (modal_fields.get("tp_pct") or "").strip()
+        sl_text = (modal_fields.get("sl_pct") or "").strip()
+        if not tp_text or not sl_text:
+            await _send("TP/SL 수익률을 모두 입력해주세요.", ephemeral=True)
+            return
+
+        tp_pct = self._parse_float(tp_text, 0.0)
+        sl_pct = self._parse_float(sl_text, 0.0)
+        if tp_pct <= 0 or sl_pct <= 0:
+            await _send("TP/SL 수익률은 0보다 큰 값이어야 합니다.", ephemeral=True)
+            return
+
+        runner = self._ensure_live_runner_for_test()
+        if runner is None:
+            await _send("Live runner could not be initialized. Check API settings.", ephemeral=True)
+            return
+
+        info, err = await runner.set_livetest_targets(
+            side,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+        )
+        if err:
+            await _send(err, ephemeral=True)
+            return
+        if not info:
+            await _send("Failed to apply TP/SL targets.", ephemeral=True)
+            return
+
+        side_label = "롱" if info.get("side") == "long" else "숏"
+        entry_price = info.get("entry_price", 0.0)
+        leverage = info.get("leverage", 1.0)
+        tp_price = info.get("tp_price")
+        sl_price = info.get("sl_price")
+        await _send(
+            f"Live test TP/SL 설정 완료 ({side_label}). "
+            f"entry {self._fmt_price(entry_price)}, lev {leverage:.2f}x, "
+            f"TP {self._fmt_price(tp_price)} ({tp_pct:.2f}%), "
+            f"SL {self._fmt_price(sl_price)} (-{sl_pct:.2f}%)",
+            ephemeral=isinstance(target, discord.Interaction),
+        )
+
+    async def _sync_sim_with_live(self, ctx: commands.Context) -> None:
+        live_cfg = self._get_realtime_cfg("live")
+        sim_cfg = self._get_realtime_cfg("sim")
+        live_runner = self._runner_for_group("live")
+        live_payload = self._realtime_payloads.get("live")
+        if live_payload is None and live_runner is not None:
+            live_payload = live_runner.latest_payload
+        if live_payload is None:
+            await ctx.reply("Live 상태가 아직 없습니다. live runner가 켜져 있고 status가 찍힌 뒤 다시 시도해주세요.")
+            return
+
+        symbol = str(live_payload.symbol or live_cfg.get("symbol") or sim_cfg.get("symbol") or "").upper()
+        interval = str(live_payload.interval or live_cfg.get("interval") or sim_cfg.get("interval") or "")
+        price = float(live_payload.price or 0.0)
+        equity = float(live_payload.equity or 0.0)
+        free_balance = float(live_payload.free_balance or 0.0)
+        positions = self._normalize_position_snapshot(live_payload.positions)
+
+        if equity <= 0:
+            client, err = self._get_live_client()
+            if err:
+                await ctx.reply(f"Live 자산 조회 실패: {err}")
+                return
+            available, wallet, live_price, note = await self._fetch_live_account_snapshot(
+                client, symbol
+            )
+            if wallet is not None and wallet > 0:
+                equity = float(wallet)
+            elif available is not None and available > 0:
+                equity = float(available)
+            if free_balance <= 0 and available is not None and available > 0:
+                free_balance = float(available)
+            if price <= 0 and live_price is not None:
+                price = float(live_price)
+            if note:
+                logger.warning("Live snapshot warning: %s", note)
+
+        if equity <= 0:
+            equity = float(sim_cfg.get("initial_balance") or self.settings.backtest.get("initial_balance") or 0.0)
+
+        new_cfg = copy.deepcopy(live_cfg) if isinstance(live_cfg, dict) else {}
+        new_cfg.pop("api_key", None)
+        new_cfg.pop("api_secret", None)
+        new_cfg["enabled"] = bool(sim_cfg.get("enabled", False))
+        new_cfg["auto_trade"] = False
+        new_cfg["sync_exchange_positions"] = False
+        new_cfg["exchange_position_authority"] = False
+        new_cfg["state_path"] = sim_cfg.get("state_path") or "backtest/sim_state.json"
+        if symbol:
+            new_cfg["symbol"] = symbol
+        if interval:
+            new_cfg["interval"] = interval
+        if equity > 0:
+            new_cfg["initial_balance"] = equity
+            if isinstance(new_cfg.get("backtest"), dict):
+                new_cfg["backtest"]["initial_balance"] = equity
+
+        self.settings.discord["sim"] = new_cfg
+        self.sim_cfg = new_cfg
+        save_settings(self.settings_path, self.settings)
+
+        payload = RunnerPayload(
+            symbol=symbol or "UNKNOWN",
+            interval=interval or "n/a",
+            price=price,
+            equity=equity,
+            free_balance=free_balance if free_balance > 0 else equity,
+            positions=positions,
+            engine_positions=copy.deepcopy(positions),
+            updated_at=time.time(),
+        )
+
+        sim_runner = self._runner_for_group("sim")
+        if sim_runner is not None:
+            await sim_runner.apply_external_snapshot(
+                symbol=payload.symbol,
+                interval=payload.interval,
+                price=payload.price,
+                equity=payload.equity,
+                free_balance=payload.free_balance,
+                positions=payload.positions,
+                engine_positions=payload.engine_positions,
+            )
+        else:
+            self._write_state_snapshot(new_cfg["state_path"], group="sim", payload=payload)
+
+        running = bool(sim_runner and sim_runner._task and not sim_runner._task.done())
+        if running:
+            self._stop_realtime_runner("sim")
+            err = self._start_realtime_runner("sim", reset_engine_positions=True)
+            if err:
+                await ctx.reply(f"sim 설정을 맞췄지만 재시작 실패: {err}")
+                return
+            restart_note = "runner 재시작 완료"
+        else:
+            restart_note = "runner 재시작 없음"
+
+        await ctx.reply(
+            "sim 상태를 live와 동기화했어요.\n"
+            f"- symbol/interval: {payload.symbol} {payload.interval}\n"
+            f"- equity: {payload.equity:.2f} | free: {payload.free_balance:.2f}\n"
+            f"- positions: long={'Y' if positions.get('long') else 'N'} / short={'Y' if positions.get('short') else 'N'}\n"
+            f"- {restart_note}"
+        )
+
     async def _realtime_text_command(
         self, ctx: commands.Context, group: str, *, args: str = ""
     ) -> None:
@@ -13342,24 +15402,93 @@ class BacktestBot(commands.Bot):
         tokens = shlex.split(args or "")
         if tokens:
             first = tokens[0].lower()
+            if first in {"sync_live", "synclive", "mirror_live", "mirror"}:
+                if group != "sim":
+                    await ctx.reply("이 명령어는 sim에서만 사용 가능해요.")
+                    return
+                if not self._is_guild_owner_ctx(ctx):
+                    await ctx.reply("Only the server owner can sync sim with live.")
+                    return
+                await self._sync_sim_with_live(ctx)
+                return
             if first in {"graph", "chart", "snapshot"}:
                 await self._send_realtime_entry_chart(ctx, group)
+                return
+            if first in {"ordermode", "order_mode", "ordertype", "order_type"}:
+                if group != "live":
+                    await ctx.reply("주문 타입 설정은 live에서만 지원돼요.")
+                    return
+                if not self._is_guild_owner_ctx(ctx):
+                    await ctx.reply("Only the server owner can change live order modes.")
+                    return
+
+                def _normalize_mode(value: Optional[str]) -> Optional[str]:
+                    if value is None:
+                        return None
+                    text = str(value).strip().lower()
+                    if text in {"maker", "post", "post_only", "postonly", "limit"}:
+                        return "maker"
+                    if text in {"taker", "market", "mkt"}:
+                        return "taker"
+                    return None
+
+                cfg = self._get_realtime_cfg("live")
+                if len(tokens) == 1 or tokens[1].lower() in {"show", "status"}:
+                    view = LiveOrderModeView(self, ctx.author.id)
+                    message = await ctx.reply(
+                        f"{self._live_order_mode_status_text()}\n"
+                        "버튼으로 선택하거나 `!live ordermode open|close|both maker|taker` 사용",
+                        view=view,
+                    )
+                    view.message = message
+                    return
+
+                if len(tokens) < 3:
+                    if tokens[1].lower() in {"open", "close", "both"}:
+                        view = LiveOrderModeView(self, ctx.author.id)
+                        message = await ctx.reply(
+                            f"{self._live_order_mode_status_text()}\n"
+                            "버튼으로 선택하거나 `!live ordermode open|close|both maker|taker` 사용",
+                            view=view,
+                        )
+                        view.message = message
+                        return
+                    await ctx.reply("사용법: `!live ordermode open|close|both maker|taker`")
+                    return
+
+                target = tokens[1].lower()
+                mode = _normalize_mode(tokens[2])
+                if mode is None:
+                    await ctx.reply("주문 타입은 maker 또는 taker여야 해요.")
+                    return
+                ok, message = self._apply_live_order_mode(target, mode)
+                if not ok:
+                    await ctx.reply(message)
+                    return
+                await ctx.reply(message)
                 return
             if first in {"apply_backtest", "applybt", "bt", "backtest"}:
                 if not self._is_guild_owner_ctx(ctx):
                     await ctx.reply("Only the server owner can apply backtest settings.")
                     return
-                applied, summary = self._apply_backtest_settings_to_realtime(group)
-                runner = self._runner_for_group(group)
-                running = bool(runner and getattr(runner, "is_running", lambda: False)())
-                if running:
-                    self._stop_realtime_runner(group)
-                    err = self._start_realtime_runner(group)
-                    if err:
-                        await ctx.reply(
-                            f"{group} 설정을 적용했지만 재시작 실패: {err}"
-                        )
-                        return
+                applied_map, summary_map = self._apply_backtest_settings_to_realtime(group)
+                restart_notes: Dict[str, str] = {}
+                for target_group in ("sim", "live"):
+                    runner = self._runner_for_group(target_group)
+                    running = bool(runner and getattr(runner, "is_running", lambda: False)())
+                    if running:
+                        self._stop_realtime_runner(target_group)
+                        err = self._start_realtime_runner(target_group)
+                        if err:
+                            await ctx.reply(
+                                f"{target_group} 설정을 적용했지만 재시작 실패: {err}"
+                            )
+                            return
+                        restart_notes[target_group] = "재시작 완료"
+                    else:
+                        restart_notes[target_group] = "다음 시작부터 적용"
+
+                summary = summary_map.get("live") or summary_map.get("sim") or {}
                 backtest_count = len(summary.get("backtest_keys", []))
                 strategy_count = len(summary.get("strategy_params_keys", []))
                 data_count = len(summary.get("data_keys", []))
@@ -13370,11 +15499,11 @@ class BacktestBot(commands.Bot):
                 ]
                 if summary.get("strategy_name"):
                     summary_parts.append(f"strategy_name {summary['strategy_name']}")
-                applied_keys = ", ".join(summary_parts) if applied else "none"
-                restart_note = " (runner 재시작 완료)" if running else " (다음 시작부터 적용)"
+                applied_keys = ", ".join(summary_parts) if applied_map else "none"
                 await ctx.reply(
-                    f"{group} 설정을 backtest 기준으로 맞췄어요.{restart_note}\n"
-                    f"Applied: {applied_keys}"
+                    "sim/live 설정을 backtest 기준으로 맞췄어요.\n"
+                    f"Applied: {applied_keys}\n"
+                    f"sim: {restart_notes.get('sim')}, live: {restart_notes.get('live')}"
                 )
                 return
             if first == "setting":
@@ -13750,7 +15879,7 @@ class BacktestBot(commands.Bot):
         action = self._parse_realtime_action(args or "")
         if action is None:
             await ctx.reply(
-                "Usage: `!sim on|off|status|restart|asset|interval|symbol|apply_backtest|graph` "
+                "Usage: `!sim on|off|status|restart|asset|interval|symbol|apply_backtest|sync_live|graph` "
                 "or `!live on|off|status|restart|api|interval|symbol|check|apply_backtest|graph`"
             )
             return
@@ -13773,10 +15902,17 @@ class BacktestBot(commands.Bot):
                 auto_trade = True
             maker_offset = cfg.get("maker_offset_bps", "n/a")
             maker_aggressive = cfg.get("maker_aggressive_ticks", "n/a")
+            order_mode_open = self._resolve_live_order_mode_cfg(
+                cfg, "order_mode_open", "order_mode_buy"
+            )
+            order_mode_close = self._resolve_live_order_mode_cfg(
+                cfg, "order_mode_close", "order_mode_sell"
+            )
             await ctx.reply(
                 f"{group.upper()} 상태: enabled={enabled} | running={running} | "
                 f"auto_trade={auto_trade} | {symbol} {interval} | "
-                f"maker_offset_bps={maker_offset} | maker_aggressive_ticks={maker_aggressive}"
+                f"maker_offset_bps={maker_offset} | maker_aggressive_ticks={maker_aggressive} | "
+                f"order_mode open={order_mode_open} close={order_mode_close}"
             )
             return
 
@@ -13787,9 +15923,15 @@ class BacktestBot(commands.Bot):
             return
 
         if action == "restart":
+            reset_engine_positions = False
+            if group == "live":
+                aligned = self._positions_aligned_for_restart(self._runner_for_group(group))
+                reset_engine_positions = aligned is not True
             self._stop_realtime_runner(group)
             self._set_realtime_enabled(group, True)
-            err = self._start_realtime_runner(group)
+            err = self._start_realtime_runner(
+                group, reset_engine_positions=reset_engine_positions
+            )
             if err:
                 await ctx.reply(f"{group.upper()} restart failed: {err}")
                 return
@@ -14468,6 +16610,8 @@ class BacktestBot(commands.Bot):
             "- `!costom2 [--data FILE]` : Equity + MDD + monthly stats chart.",
             "- `!costom3 [options]` : Overlay grid results + monthly best label.",
             "- `!costom4 [--data FILE]` : Monthly return stability + dispersion stats.",
+            "- `!costom5 [options]` : TP/SL target win-rate by parameter.",
+            "- `!costom6 [--data FILE]` : Auto leverage min-loss trade stats + charts.",
             "- `!chart [options]` : Render charts.",
             "",
             "Strategy",
@@ -14504,7 +16648,8 @@ class BacktestBot(commands.Bot):
             "- `!sim asset [amount]` : View/set sim initial balance.",
             "- `!sim interval [5m]` : View/set sim interval.",
             "- `!sim symbol [XRPUSDT]` : View/set sim symbol.",
-            "- `!sim apply_backtest` : Copy backtest/strategy/data settings into sim.",
+            "- `!sim apply_backtest` : Copy backtest/strategy/data settings into sim+live.",
+            "- `!sim sync_live` : Sync sim state/settings to match live snapshot.",
             "- `!sim setting show [name]` : Show current or saved sim profile.",
             "- `!sim setting list` : List sim profiles.",
             "- `!sim setting save` : Save sim profile (new/overwrite).",
@@ -14521,8 +16666,9 @@ class BacktestBot(commands.Bot):
             "- `!live apisecret [SECRET]` : Set API secret only.",
             "- `!live interval [5m]` : View/set live interval.",
             "- `!live symbol [BTCUSDT]` : View/set live symbol.",
+            "- `!live ordermode open|close|both maker|taker` : Set live order type per entry/exit.",
             "- `!live check` : Verify API connectivity and test buy/sell orders (no execution).",
-            "- `!live apply_backtest` : Copy backtest/strategy/data settings into live.",
+            "- `!live apply_backtest` : Copy backtest/strategy/data settings into sim+live.",
             "- `!live setting show [name]` : Show current or saved live profile.",
             "- `!live setting list` : List live profiles.",
             "- `!live setting save` : Save live profile (new/overwrite).",
@@ -14565,6 +16711,40 @@ class BacktestBot(commands.Bot):
             lines.append(f"{index}. {guess.upper()} {feedback}")
         if not lines:
             return "No guesses yet."
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_costom5_output(
+        var1: dict,
+        value: Any,
+        tp_target_stats: Dict[str, Any],
+        sl_target_stats: Dict[str, Any],
+        data_label: Optional[str] = None,
+    ) -> str:
+        def fmt_value(value: Any) -> str:
+            if isinstance(value, float):
+                return f"{value:.4g}"
+            return str(value)
+
+        tp_trades = int(tp_target_stats.get("trades", 0) or 0)
+        sl_trades = int(sl_target_stats.get("trades", 0) or 0)
+        tp_covered = int(tp_target_stats.get("trades_with_target", 0) or 0)
+        sl_covered = int(sl_target_stats.get("trades_with_target", 0) or 0)
+        tp_buckets = int(tp_target_stats.get("buckets", 0) or 0)
+        sl_buckets = int(sl_target_stats.get("buckets", 0) or 0)
+        bin_size = tp_target_stats.get("bin_size", 5.0)
+
+        lines = ["**🎯 Costom5 target win-rate**"]
+        if data_label:
+            lines.append(f"🗂️  Data: `{data_label}`")
+        lines.append(f"🧩 Var: `{var1['label']}={fmt_value(value)}`")
+        lines.append(f"🧮 Bin size: {bin_size}")
+        lines.append(
+            f"- TP targets: {tp_covered}/{tp_trades} trades | buckets {tp_buckets}"
+        )
+        lines.append(
+            f"- SL targets: {sl_covered}/{sl_trades} trades | buckets {sl_buckets}"
+        )
         return "\n".join(lines)
 
     def _get_or_start_wordle(self, channel_id: int) -> WordleGame:
@@ -14799,6 +16979,7 @@ class BacktestBot(commands.Bot):
             )
             return
 
+        self._ensure_strategy_param_defaults()
         entries = self._flatten_settings()
         if not entries:
             await interaction.response.send_message(
@@ -14865,6 +17046,14 @@ async def costom3_text_command(ctx: commands.Context, *, args: str = "") -> None
 
 async def costom4_text_command(ctx: commands.Context, *, args: str = "") -> None:
     await _get_backtest_bot(ctx).costom4_text(ctx, args=args)
+
+
+async def costom5_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).costom5_text(ctx, args=args)
+
+
+async def costom6_text_command(ctx: commands.Context, *, args: str = "") -> None:
+    await _get_backtest_bot(ctx).costom6_text(ctx, args=args)
 
 
 async def chart_text_command(ctx: commands.Context, *, args: str = "") -> None:

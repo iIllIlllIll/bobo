@@ -196,6 +196,22 @@ class BinanceFuturesClient:
         params = {"symbol": symbol.upper()} if symbol else None
         return self._request("GET", "/fapi/v2/positionRisk", params=params, signed=True)
 
+    def get_user_trades(
+        self,
+        symbol: str,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 500,
+    ) -> Any:
+        params: Dict[str, Any] = {"symbol": symbol.upper()}
+        if start_time is not None:
+            params["startTime"] = int(start_time)
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        if limit:
+            params["limit"] = int(limit)
+        return self._request("GET", "/fapi/v1/userTrades", params=params, signed=True)
+
     def get_exchange_info(self) -> Any:
         return self._request("GET", "/fapi/v1/exchangeInfo")
 

@@ -113,6 +113,13 @@ class CheatkeyStrategy(Strategy):
         auto_leverage_min_loss_pnl: float | None = None,
         auto_leverage_max_loss_pnl: float | None = None,
         auto_leverage_max_leverage: float | None = None,
+        use_auto_leverage_min_loss_multiplier: bool = False,
+        auto_leverage_min_loss_multiplier: float | None = None,
+        use_auto_leverage_sl_multiplier: bool = True,
+        auto_leverage_sl_min_pct: float | None = None,
+        auto_leverage_sl_max_pct: float | None = None,
+        auto_leverage_sl_min_multiplier: float | None = None,
+        auto_leverage_sl_max_multiplier: float | None = None,
         long_tp_pnl: float = 15.0,
         short_tp_pnl: float = 15.0,
         long_add_tp_pnl: list[float] | None = None,
@@ -127,6 +134,9 @@ class CheatkeyStrategy(Strategy):
         move_sl_use_ratio: bool = False,
         move_sl_trigger_ratio: float | None = None,
         move_sl_target_ratio: float | None = None,
+        move_sl_peak_drawdown_use: bool = False,
+        move_sl_peak_drawdown_trigger_pnl: float | None = None,
+        move_sl_peak_drawdown_exit_pnl: float | None = None,
         move_tp_on_loss: bool = False,
         move_tp_trigger_pnl: float | None = None,
         move_tp_target_pnl: float | None = None,
@@ -151,6 +161,8 @@ class CheatkeyStrategy(Strategy):
         use_timeout_cross: bool = False,
         timeout_cross_bars: int = 5,
         timeout_sell_pnl: float = 0.01,
+        use_timeout_exit: bool = False,
+        timeout_exit_minutes: int | None = None,
         use_prev_extreme_stop: bool = False,
         prev_extreme_lookback: int = 20,
         prev_extreme_buffer_pct: float = 0.1,
@@ -229,6 +241,22 @@ class CheatkeyStrategy(Strategy):
             self.auto_leverage_max_leverage = float(auto_leverage_max_leverage)
         except (TypeError, ValueError):
             self.auto_leverage_max_leverage = None
+        self.use_auto_leverage_min_loss_multiplier = bool(use_auto_leverage_min_loss_multiplier)
+        try:
+            self.auto_leverage_min_loss_multiplier = float(auto_leverage_min_loss_multiplier)
+        except (TypeError, ValueError):
+            self.auto_leverage_min_loss_multiplier = None
+        self.use_auto_leverage_sl_multiplier = bool(use_auto_leverage_sl_multiplier)
+        self.auto_leverage_sl_min_pct = _normalize_pct(auto_leverage_sl_min_pct)
+        self.auto_leverage_sl_max_pct = _normalize_pct(auto_leverage_sl_max_pct)
+        try:
+            self.auto_leverage_sl_min_multiplier = float(auto_leverage_sl_min_multiplier)
+        except (TypeError, ValueError):
+            self.auto_leverage_sl_min_multiplier = None
+        try:
+            self.auto_leverage_sl_max_multiplier = float(auto_leverage_sl_max_multiplier)
+        except (TypeError, ValueError):
+            self.auto_leverage_sl_max_multiplier = None
         self.long_tp_pnl = _normalize_pct(long_tp_pnl)
         self.short_tp_pnl = _normalize_pct(short_tp_pnl)
         self.long_add_tp_pnl = _normalize_pct_list(long_add_tp_pnl)
@@ -243,6 +271,9 @@ class CheatkeyStrategy(Strategy):
         self.move_sl_use_ratio = move_sl_use_ratio
         self.move_sl_trigger_ratio = _normalize_ratio(move_sl_trigger_ratio)
         self.move_sl_target_ratio = _normalize_ratio(move_sl_target_ratio)
+        self.move_sl_peak_drawdown_use = bool(move_sl_peak_drawdown_use)
+        self.move_sl_peak_drawdown_trigger_pnl = _normalize_pct(move_sl_peak_drawdown_trigger_pnl)
+        self.move_sl_peak_drawdown_exit_pnl = _normalize_pct(move_sl_peak_drawdown_exit_pnl)
         self.move_tp_on_loss = move_tp_on_loss
         self.move_tp_trigger_pnl = _normalize_pct(move_tp_trigger_pnl)
         self.move_tp_target_pnl = _normalize_pct(move_tp_target_pnl)
@@ -270,6 +301,8 @@ class CheatkeyStrategy(Strategy):
         self.use_timeout_cross = use_timeout_cross
         self.timeout_cross_bars = timeout_cross_bars
         self.timeout_sell_pnl = _normalize_pct(timeout_sell_pnl)
+        self.use_timeout_exit = use_timeout_exit
+        self.timeout_exit_minutes = timeout_exit_minutes
         self.use_prev_extreme_stop = use_prev_extreme_stop
         self.prev_extreme_lookback = int(prev_extreme_lookback)
         self.prev_extreme_buffer_pct = _normalize_buffer_pct(prev_extreme_buffer_pct) or 0.0

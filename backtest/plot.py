@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
+import math
 from pathlib import Path
 from typing import Optional, Any, Dict, Callable
 
@@ -199,6 +200,158 @@ def create_equity_price_chart(
     return output_path
 
 
+def create_costom6_trade_return_extremes_chart(
+    trades: list[dict[str, Any]],
+    output_path: Path,
+    max_points: int = 300,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    def _coerce(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(num):
+            return None
+        return num
+
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        final_ret = _coerce(trade.get("return"))
+        min_ret = _coerce(trade.get("min_return"))
+        max_ret = _coerce(trade.get("max_return"))
+        if final_ret is None and min_ret is None and max_ret is None:
+            continue
+        rows.append(
+            {
+                "final": final_ret if final_ret is not None else 0.0,
+                "min": min_ret,
+                "max": max_ret,
+            }
+        )
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda item: item.get("final", 0.0))
+    if max_points and len(rows) > max_points:
+        rows = rows[:max_points]
+
+    x_values = np.arange(1, len(rows) + 1)
+    final_vals = np.array([item.get("final", 0.0) * 100.0 for item in rows], dtype=float)
+    min_vals = np.array(
+        [item.get("min", np.nan) * 100.0 if item.get("min") is not None else np.nan for item in rows],
+        dtype=float,
+    )
+    max_vals = np.array(
+        [item.get("max", np.nan) * 100.0 if item.get("max") is not None else np.nan for item in rows],
+        dtype=float,
+    )
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.scatter(x_values, min_vals, s=18, color="#d62728", label="Min return", alpha=0.75)
+    ax.scatter(x_values, max_vals, s=18, color="#2ca02c", label="Max return", alpha=0.75)
+    ax.scatter(x_values, final_vals, s=24, color="#1f77b4", label="Final return", alpha=0.85)
+    ax.axhline(0.0, color="#444444", linewidth=1.0, alpha=0.6)
+    ax.set_xlabel("Trade (sorted by final return)")
+    ax.set_ylabel("Return % (leveraged)")
+    ax.grid(True, axis="y", alpha=0.3)
+    if title:
+        ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def create_costom6_holding_time_chart(
+    trades: list[dict[str, Any]],
+    output_path: Path,
+    max_points: int = 300,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    def _coerce_float(value: Any) -> Optional[float]:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(val):
+            return None
+        return val
+
+    def _to_timestamp(value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+            ts = ts.tz_localize(None)
+        return ts
+
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        final_ret = _coerce_float(trade.get("return"))
+        entry_time = trade.get("entry_time")
+        exit_time = trade.get("timestamp")
+        duration_minutes: Optional[float] = None
+        entry_ts = _to_timestamp(entry_time)
+        exit_ts = _to_timestamp(exit_time)
+        if entry_ts is not None and exit_ts is not None:
+            duration_minutes = (exit_ts - entry_ts).total_seconds() / 60.0
+        elif isinstance(entry_time, (int, float)) and isinstance(exit_time, (int, float)):
+            duration_minutes = float(exit_time) - float(entry_time)
+        if duration_minutes is None or not np.isfinite(duration_minutes):
+            continue
+        rows.append(
+            {
+                "final": final_ret if final_ret is not None else 0.0,
+                "minutes": max(0.0, float(duration_minutes)),
+            }
+        )
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda item: item.get("final", 0.0))
+    if max_points and len(rows) > max_points:
+        rows = rows[:max_points]
+
+    minutes = np.array([item["minutes"] for item in rows], dtype=float)
+    unit = "minutes"
+    scale = 1.0
+    if np.nanmax(minutes) >= 180.0:
+        unit = "hours"
+        scale = 1.0 / 60.0
+    values = minutes * scale
+    x_values = np.arange(1, len(values) + 1)
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(x_values, values, color="#9467bd", alpha=0.8)
+    ax.set_xlabel("Trade (sorted by final return)")
+    ax.set_ylabel(f"Holding time ({unit})")
+    ax.grid(True, axis="y", alpha=0.3)
+    if title:
+        ax.set_title(title)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
 def create_equity_price_mdd_chart(
     result: BacktestResult,
     data: pd.DataFrame,
@@ -315,7 +468,7 @@ def create_equity_mdd_monthly_stats_chart(
 
     exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
     trade_rows = []
-    for trade in exit_trades:
+    for trade_idx, trade in enumerate(exit_trades):
         exit_time = trade.get("exit_time") or trade.get("timestamp") or trade.get("entry_time")
         exit_ts = pd.to_datetime(exit_time, errors="coerce")
         if pd.isna(exit_ts):
@@ -570,7 +723,7 @@ def compute_entry_minute_win_rate(
         return empty_df, {"trades": 0, "minutes": 0}
 
     rows: list[dict[str, Any]] = []
-    for trade in exit_trades:
+    for trade_id, trade in enumerate(exit_trades):
         entry_time = trade.get("entry_time")
         if entry_time is None:
             continue
@@ -672,7 +825,7 @@ def compute_entry_minute_tp_rate(
         }
 
     rows: list[dict[str, Any]] = []
-    for trade in exit_trades:
+    for trade_idx, trade in enumerate(exit_trades):
         entry_time = trade.get("entry_time")
         if entry_time is None:
             continue
@@ -723,6 +876,335 @@ def compute_entry_minute_tp_rate(
         "tp_rate": overall_tp_rate,
     }
     return minute_df, stats
+
+
+def compute_entry_elapsed_return_distribution(
+    result: BacktestResult,
+    data: pd.DataFrame,
+    step_minutes: int = 10,
+    max_minutes: int = 1000,
+) -> tuple[pd.DataFrame, dict]:
+    exit_trades = [trade for trade in result.trades if trade.get("type") == "exit"]
+    total_exit_trades = int(len(exit_trades))
+    rows: list[dict[str, Any]] = []
+    step_minutes = max(1, int(step_minutes))
+    max_minutes = max(step_minutes, int(max_minutes))
+
+    if data.empty or "timestamp" not in data.columns or "close" not in data.columns:
+        empty_df = pd.DataFrame(
+            columns=["group", "bucket", "count", "min", "max", "median"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "step_minutes": step_minutes,
+            "max_minutes": max_minutes,
+            "groups": {},
+        }
+
+    price_df = data[["timestamp", "close"]].copy()
+    price_df["timestamp"] = pd.to_datetime(
+        price_df["timestamp"], errors="coerce", utc=True
+    )
+    price_df = price_df.dropna(subset=["timestamp", "close"]).sort_values("timestamp")
+    if price_df.empty:
+        empty_df = pd.DataFrame(
+            columns=["group", "bucket", "count", "min", "max", "median"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "step_minutes": step_minutes,
+            "max_minutes": max_minutes,
+            "groups": {},
+        }
+
+    price_df["timestamp"] = price_df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    def _coerce_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(number):
+            return None
+        return number
+
+    def _resolve_direction(trade: dict[str, Any]) -> int:
+        direction = trade.get("direction", 0)
+        try:
+            direction_val = int(direction)
+        except (TypeError, ValueError):
+            direction_val = 0
+        if direction_val in {1, -1}:
+            return direction_val
+        side_hint = (
+            trade.get("side")
+            or trade.get("position_side")
+            or trade.get("positionSide")
+            or trade.get("entry_side")
+        )
+        if isinstance(side_hint, str):
+            side_norm = side_hint.strip().lower()
+            if side_norm in {"long", "buy", "l"}:
+                return 1
+            if side_norm in {"short", "sell", "s"}:
+                return -1
+        return 0
+
+    buckets = list(range(step_minutes, max_minutes + step_minutes, step_minutes))
+    target_rows: list[dict[str, Any]] = []
+
+    for trade_idx, trade in enumerate(exit_trades):
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            continue
+        entry_ts = pd.to_datetime(entry_time, errors="coerce", utc=True)
+        if pd.isna(entry_ts):
+            continue
+        entry_ts = entry_ts.tz_convert("UTC").tz_localize(None)
+        entry_price = _coerce_float(trade.get("entry_price"))
+        if entry_price is None or entry_price <= 0:
+            entry_lookup = pd.DataFrame({"entry_ts": [entry_ts]})
+            entry_match = pd.merge_asof(
+                entry_lookup,
+                price_df,
+                left_on="entry_ts",
+                right_on="timestamp",
+                direction="nearest",
+                allow_exact_matches=True,
+            )
+            if entry_match.empty or pd.isna(entry_match["close"].iloc[0]):
+                continue
+            entry_price = float(entry_match["close"].iloc[0])
+            if not np.isfinite(entry_price) or entry_price <= 0:
+                continue
+        direction_val = _resolve_direction(trade)
+        if direction_val not in {1, -1}:
+            continue
+        leverage = _coerce_float(trade.get("leverage")) or 1.0
+        reason = trade.get("exit_reason")
+        if _is_tp_reason(reason):
+            group = "TP"
+        elif _is_sl_reason(reason):
+            group = "SL"
+        else:
+            group = "Other"
+        trade_id = (
+            trade.get("id")
+            or trade.get("trade_id")
+            or trade.get("entry_id")
+            or trade.get("order_id")
+            or trade_idx
+        )
+        for bucket in buckets:
+            target_ts = entry_ts + timedelta(minutes=bucket)
+            target_rows.append(
+                {
+                    "trade_id": trade_id,
+                    "group": group,
+                    "bucket": int(bucket),
+                    "entry_price": entry_price,
+                    "direction": direction_val,
+                    "leverage": leverage,
+                    "target_ts": target_ts,
+                }
+            )
+
+    if not target_rows:
+        empty_df = pd.DataFrame(
+            columns=["group", "bucket", "count", "min", "max", "median"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "step_minutes": step_minutes,
+            "max_minutes": max_minutes,
+            "groups": {},
+        }
+
+    targets = pd.DataFrame(target_rows).sort_values("target_ts")
+    merged = pd.merge_asof(
+        targets,
+        price_df,
+        left_on="target_ts",
+        right_on="timestamp",
+        direction="forward",
+        allow_exact_matches=True,
+    )
+    merged = merged.dropna(subset=["close", "entry_price"])
+    if merged.empty:
+        empty_df = pd.DataFrame(
+            columns=["group", "bucket", "count", "min", "max", "median"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "step_minutes": step_minutes,
+            "max_minutes": max_minutes,
+            "groups": {},
+        }
+
+    merged["return_pct"] = (
+        (merged["close"].astype(float) - merged["entry_price"].astype(float))
+        / merged["entry_price"].astype(float)
+        * merged["direction"].astype(float)
+        * merged["leverage"].astype(float)
+        * 100.0
+    )
+    merged = merged[np.isfinite(merged["return_pct"])]
+
+    if merged.empty:
+        empty_df = pd.DataFrame(
+            columns=["group", "bucket", "count", "min", "max", "median"]
+        )
+        return empty_df, {
+            "trades": total_exit_trades,
+            "trades_with_time": 0,
+            "step_minutes": step_minutes,
+            "max_minutes": max_minutes,
+            "groups": {},
+        }
+
+    df = merged
+    grouped = df.groupby(["group", "bucket"], sort=True)
+    out_rows: list[dict[str, Any]] = []
+    for (group, bucket), sub in grouped:
+        values = sub["return_pct"].astype(float)
+        if values.empty:
+            continue
+        out_rows.append(
+            {
+                "group": str(group),
+                "bucket": int(bucket),
+                "count": int(len(values)),
+                "min": float(values.min()),
+                "max": float(values.max()),
+                "median": float(np.median(values)),
+            }
+        )
+
+    dist_df = pd.DataFrame(out_rows).sort_values(["group", "bucket"])
+    total_used_trades = int(df["trade_id"].nunique())
+    group_totals = df.groupby("group")["trade_id"].nunique().to_dict()
+    group_stats: dict[str, dict[str, float]] = {}
+    for group, count in group_totals.items():
+        ratio = float(count) / float(total_used_trades) * 100.0 if total_used_trades > 0 else 0.0
+        group_stats[str(group)] = {"count": int(count), "ratio": ratio}
+
+    stats = {
+        "trades": total_exit_trades,
+        "trades_with_time": total_used_trades,
+        "step_minutes": step_minutes,
+        "max_minutes": max_minutes,
+        "groups": group_stats,
+    }
+    return dist_df, stats
+
+
+def create_entry_elapsed_return_distribution_group_chart(
+    result: BacktestResult,
+    data: pd.DataFrame,
+    output_path: Path,
+    group: str,
+    step_minutes: int = 10,
+    max_minutes: int = 1000,
+    title: Optional[str] = None,
+) -> Optional[Path]:
+    dist_df, stats = compute_entry_elapsed_return_distribution(
+        result,
+        data,
+        step_minutes=step_minutes,
+        max_minutes=max_minutes,
+    )
+    if dist_df.empty:
+        return None
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    buckets = np.arange(step_minutes, max_minutes + step_minutes, step_minutes)
+    colors = {
+        "TP": "#2ca02c",
+        "SL": "#d62728",
+        "Other": "#1f77b4",
+    }
+    color = colors.get(group, "#1f77b4")
+    sub = dist_df[dist_df["group"] == group].copy()
+
+    fig, ax = plt.subplots(figsize=(11, 4.2))
+    min_vals = np.full_like(buckets, np.nan, dtype=float)
+    max_vals = np.full_like(buckets, np.nan, dtype=float)
+    median_vals = np.full_like(buckets, np.nan, dtype=float)
+    if not sub.empty:
+        bucket_map = {int(row["bucket"]): row for _, row in sub.iterrows()}
+        for idx, bucket in enumerate(buckets):
+            row = bucket_map.get(int(bucket))
+            if row is None:
+                continue
+            min_vals[idx] = float(row["min"])
+            max_vals[idx] = float(row["max"])
+            median_vals[idx] = float(row["median"])
+
+        ax.fill_between(
+            buckets,
+            min_vals,
+            max_vals,
+            color=color,
+            alpha=0.18,
+            label="min/max",
+        )
+        ax.plot(
+            buckets,
+            median_vals,
+            color=color,
+            linewidth=1.8,
+            label="median",
+        )
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "no trades",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9,
+            color="#666666",
+        )
+
+    ax.axhline(0.0, color="#555555", linewidth=0.8, alpha=0.5)
+    ax.set_ylabel("Return (%)")
+    ax.set_xlabel("Minutes since entry (bucketed)")
+    ax.set_title(title or f"Return distribution by minutes after entry ({group})")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks(np.arange(step_minutes, max_minutes + 1, 100))
+    ax.set_xlim(step_minutes, max_minutes)
+
+    group_stats = stats.get("groups", {}).get(group, {})
+    count = int(group_stats.get("count", 0) or 0)
+    ratio = float(group_stats.get("ratio", 0.0) or 0.0)
+    total_exit = int(stats.get("trades", 0) or 0)
+    covered = int(stats.get("trades_with_time", 0) or 0)
+    ax.text(
+        0.01,
+        0.96,
+        f"Trades {count} ({ratio:.1f}%) | Exit trades {total_exit} | Covered {covered}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8, edgecolor="none"),
+    )
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
 
 
 def compute_tp_hit_rate(result: BacktestResult) -> dict[str, float]:
